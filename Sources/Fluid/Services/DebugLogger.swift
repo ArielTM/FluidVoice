@@ -41,7 +41,7 @@ final nonisolated class DebugLogger: @unchecked Sendable {
 }
 
 // Convenience functions for easier logging
-extension DebugLogger {
+nonisolated extension DebugLogger {
     func info(_ message: String, source: String = "App") {
         self.log(message, level: .info, source: source)
     }
