@@ -15,11 +15,14 @@ private actor TranscriptionExecutor {
     private var lastTask: Task<Void, Never>?
     private var operationCancellations: [UUID: () -> Void] = [:]
 
-    func run<T>(_ operation: @escaping () async throws -> T) async throws -> T {
+    func run<T>(benchmarkSessionID: Int? = nil, _ operation: @escaping () async throws -> T) async throws -> T {
+        logTranscriptionExecutorPhase("entered", sessionID: benchmarkSessionID)
         let previous = self.lastTask
         let operationID = UUID()
         let task = Task<T, Error> {
+            logTranscriptionExecutorPhase("task_started", sessionID: benchmarkSessionID)
             _ = await previous?.result
+            logTranscriptionExecutorPhase("previous_finished", sessionID: benchmarkSessionID)
             try Task.checkCancellation()
             return try await operation()
         }
@@ -39,6 +42,15 @@ private actor TranscriptionExecutor {
     }
 }
 
+private nonisolated func logTranscriptionExecutorPhase(_ phase: String, sessionID: Int?) {
+    guard let sessionID else { return }
+    let timestamp = ProcessInfo.processInfo.systemUptime
+    DebugLogger.shared.info(
+        "ASR_BENCH t=\(timestamp) session=\(sessionID) final_queue_\(phase) mainThread=\(Thread.isMainThread)",
+        source: "ASRBenchmark"
+    )
+}
+
 private nonisolated func logStreamingProviderOperationReturn(
     sessionID: Int,
     operationID: UUID,
@@ -50,6 +62,23 @@ private nonisolated func logStreamingProviderOperationReturn(
             "session=\(sessionID) operation=\(operationID.uuidString) route=\(route)",
         source: "ASRBenchmark"
     )
+}
+
+/// Keeps a stop-state UI refresh from entering the main-actor queue ahead of
+/// final transcription. The owner must always finish the gate; repeated finishes
+/// are harmless so early-return paths can share one cleanup.
+struct ASRStopUIInvalidationGate {
+    private(set) var isDeferring = false
+
+    mutating func begin() {
+        self.isDeferring = true
+    }
+
+    mutating func finish() -> Bool {
+        guard self.isDeferring else { return false }
+        self.isDeferring = false
+        return true
+    }
 }
 
 /// Identifies the recording and provider generation allowed to publish a live preview.
@@ -379,6 +408,13 @@ final class ASRService: ObservableObject {
     @Published private(set) var isMicrophonePreviewActive: Bool = false
     @Published private(set) var microphonePreviewError: String?
     @Published private(set) var audioCaptureStateSettledTick: UInt64 = 0
+    let deferredStopUIInvalidationDidFlush = PassthroughSubject<Void, Never>()
+    private var stopUIInvalidationGate = ASRStopUIInvalidationGate()
+    private var stopUIInvalidationTimeoutTask: Task<Void, Never>?
+    var defersStopUIInvalidation: Bool {
+        self.stopUIInvalidationGate.isDeferring
+    }
+
     private var microphonePreviewOperationGeneration: UInt64 = 0
     private var isMicrophonePreviewRequested = false
     private(set) var lastDictionaryTrainingResult: ASRTranscriptionResult?
@@ -2604,6 +2640,8 @@ final class ASRService: ObservableObject {
 
         // Set isRunning to false before teardown so in-flight ASR chunks stop safely.
         DebugLogger.shared.debug("🚫 Setting isRunning = false...", source: "ASRService")
+        self.beginDeferredStopUIInvalidation()
+        defer { self.finishDeferredStopUIInvalidation() }
         self.isRunning = false
         DebugLogger.shared.debug("✅ isRunning disabled", source: "ASRService")
 
@@ -2752,6 +2790,7 @@ final class ASRService: ObservableObject {
             if self.isAsrReady, provider.isReady {
                 self.benchmarkLog("stop_ensure_ready skipped=true elapsedMs=0")
             } else {
+                self.finishDeferredStopUIInvalidation()
                 DebugLogger.shared.debug("🔍 Calling ensureAsrReady()...", source: "ASRService")
                 try await self.ensureAsrReady()
                 provider = self.transcriptionProvider
@@ -2777,15 +2816,17 @@ final class ASRService: ObservableObject {
             let finalSource: String
             if useDictionaryTrainingPath {
                 result = try await self.transcriptionExecutor.run { [provider] in
-                    try await provider.transcribeDictionaryTraining(pcm)
+                    self.finishDeferredStopUIInvalidation()
+                    return try await provider.transcribeDictionaryTraining(pcm)
                 }
                 self.lastDictionaryTrainingResult = result
                 finalSource = "dictionaryTraining"
             } else {
                 self.benchmarkLog("final_executor_request")
-                result = try await self.transcriptionExecutor.run { [provider] in
+                result = try await self.transcriptionExecutor.run(benchmarkSessionID: self.benchmarkSessionID) { [provider] in
                     let executionStartedAt = ProcessInfo.processInfo.systemUptime
-                    DebugLogger.shared.info("ASR_BENCH t=\(executionStartedAt) final_executor_begin", source: "ASRBenchmark")
+                    DebugLogger.shared.info("ASR_BENCH t=\(executionStartedAt) final_executor_begin mainThread=\(Thread.isMainThread)", source: "ASRBenchmark")
+                    self.finishDeferredStopUIInvalidation()
                     defer {
                         DebugLogger.shared.info("ASR_BENCH t=\(ProcessInfo.processInfo.systemUptime) final_executor_end", source: "ASRBenchmark")
                     }
@@ -2892,6 +2933,24 @@ final class ASRService: ObservableObject {
             self.benchmarkLog("stop_end result=error totalMs=\(self.elapsedMilliseconds(since: stopStartedAt)) error=\(error.localizedDescription)")
             return ""
         }
+    }
+
+    private func beginDeferredStopUIInvalidation() {
+        self.stopUIInvalidationGate.begin()
+        self.stopUIInvalidationTimeoutTask?.cancel()
+        self.stopUIInvalidationTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard Task.isCancelled == false else { return }
+            self?.finishDeferredStopUIInvalidation()
+        }
+    }
+
+    private func finishDeferredStopUIInvalidation() {
+        guard self.stopUIInvalidationGate.finish() else { return }
+        self.stopUIInvalidationTimeoutTask?.cancel()
+        self.stopUIInvalidationTimeoutTask = nil
+        self.objectWillChange.send()
+        self.deferredStopUIInvalidationDidFlush.send()
     }
 
     func transcribeSamplesForAPI(_ inputSamples: [Float]) async throws -> ASRTranscriptionResult {

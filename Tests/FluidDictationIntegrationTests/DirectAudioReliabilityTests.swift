@@ -4,6 +4,18 @@ import Foundation
 import XCTest
 
 final class DirectAudioReliabilityTests: XCTestCase {
+    func testStopUIInvalidationGateFinishesExactlyOnce() {
+        var gate = ASRStopUIInvalidationGate()
+
+        XCTAssertFalse(gate.isDeferring)
+        XCTAssertFalse(gate.finish())
+        gate.begin()
+        XCTAssertTrue(gate.isDeferring)
+        XCTAssertTrue(gate.finish())
+        XCTAssertFalse(gate.isDeferring)
+        XCTAssertFalse(gate.finish())
+    }
+
     @MainActor
     func testStreamingIdleSchedulerCancelsWithoutLaunchingOrActiveDrain() async {
         let lifecycle = StreamingTaskLifecycle()
@@ -384,7 +396,7 @@ final class DirectAudioReliabilityTests: XCTestCase {
         XCTAssertFalse(callbackSection.contains("Task {"))
     }
 
-    func testNormalOutputDismissesOverlayOnlyAfterPasteDelivery() throws {
+    func testNormalOutputDismissesOverlayInPasteDispatchTurn() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -404,6 +416,12 @@ final class DirectAudioReliabilityTests: XCTestCase {
 
         XCTAssertLessThan(pasteIndex.lowerBound, deliveryCompletionIndex.lowerBound)
         XCTAssertLessThan(deliveryCompletionIndex.lowerBound, deliveryHandlerIndex.lowerBound)
+        let hideIndex = try XCTUnwrap(normalOutputSection.range(of: "self.hideOverlayForDispatchedPaste("))
+        XCTAssertLessThan(deliveryHandlerIndex.lowerBound, hideIndex.lowerBound)
+        let dispatchHideSection = try XCTUnwrap(source.components(separatedBy: "private func hideOverlayForDispatchedPaste(").last?.components(separatedBy: "private func handleTypingDelivery(").first)
+        XCTAssertTrue(dispatchHideSection.contains("reason=paste_dispatched"))
+        XCTAssertTrue(dispatchHideSection.contains("self.overlayLifecycleID == lifecycleID"))
+        XCTAssertFalse(dispatchHideSection.contains("Task {"))
         XCTAssertFalse(normalOutputSection.contains("Task { @MainActor in"))
         XCTAssertFalse(
             normalOutputSection[pasteIndex.lowerBound..<deliveryHandlerIndex.lowerBound]
@@ -415,7 +433,9 @@ final class DirectAudioReliabilityTests: XCTestCase {
                 .components(separatedBy: "private func hideOverlayAfterOutput()").first
         )
         XCTAssertTrue(deliveryHandlerSection.contains("self.overlayLifecycleID == expectedOverlayLifecycleID"))
-        XCTAssertTrue(deliveryHandlerSection.contains("beginProcessingCompletionAndHideOverlay()"))
+        XCTAssertTrue(normalOutputSection.contains("shouldHideOverlay: shouldHideOverlayAfterDelivery && spokenSendRequested"))
+        XCTAssertTrue(normalOutputSection.contains("shouldHide: shouldHideOverlayAfterDelivery && !spokenSendRequested"))
+        XCTAssertTrue(deliveryHandlerSection.contains("guard shouldHideOverlay else { return }"))
         XCTAssertFalse(deliveryHandlerSection.contains("await self.menuBarManager.beginProcessingCompletionAndHideOverlay"))
 
         let menuBarSource = try String(

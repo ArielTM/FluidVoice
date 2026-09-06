@@ -190,7 +190,9 @@ final class BottomOverlayWindowController {
         // Remove the panel from WindowServer before any SwiftUI state update can
         // delay paste. Opacity alone is not committed until the next frame.
         self.window?.alphaValue = 0
+        Self.overlayBench("bottom_hide_alpha_return elapsedMs=\(Self.elapsedMs(since: startedAt))")
         self.window?.orderOut(nil)
+        Self.overlayBench("bottom_hide_order_out_return elapsedMs=\(Self.elapsedMs(since: startedAt))")
         waiters.forEach { $0.resume(returning: .hidden) }
 
         Self.overlayBench(

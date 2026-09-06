@@ -102,7 +102,10 @@ final class AppServices: ObservableObject {
     private func setupASRForwarding() {
         guard let asr = _asr else { return }
         asr.objectWillChange
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self, weak asr] _ in
+                guard asr?.defersStopUIInvalidation == false else { return }
+                self?.objectWillChange.send()
+            }
             .store(in: &self.cancellables)
     }
 

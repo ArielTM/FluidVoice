@@ -26,6 +26,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     // References to app state
     private weak var asrService: ASRService?
     private var cancellables = Set<AnyCancellable>()
+    private var hasDeferredStopMenuRefresh = false
     private var configuredASRIdentifier: ObjectIdentifier?
 
     /// Overlay management (persistent, independent of window lifecycle)
@@ -107,10 +108,23 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
             .sink { [weak self] isRunning in
                 self?.isRecording = isRunning
                 self?.updateMenuBarIcon()
-                self?.updateMenu()
+                if asrService.defersStopUIInvalidation {
+                    self?.hasDeferredStopMenuRefresh = true
+                } else {
+                    self?.updateMenu()
+                }
 
                 // Handle overlay lifecycle (independent of window state)
                 self?.handleOverlayState(isRunning: isRunning, asrService: asrService)
+            }
+            .store(in: &self.cancellables)
+
+        asrService.deferredStopUIInvalidationDidFlush
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                guard let self, self.hasDeferredStopMenuRefresh else { return }
+                self.hasDeferredStopMenuRefresh = false
+                self.updateMenu()
             }
             .store(in: &self.cancellables)
 

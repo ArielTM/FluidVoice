@@ -2440,7 +2440,6 @@ struct ContentView: View {
         defer {
             self.appBench("pipeline_handler_return id=\(pipelineID) elapsedMs=\((ProcessInfo.processInfo.systemUptime - pipelineStartedAt) * 1000) deliveryMayBePending=true")
         }
-        DebugLogger.shared.debug("stopAndProcessTranscription called", source: "ContentView")
         DebugLogger.shared.info("Output route selected: \(route.rawValue)", source: "ContentView")
         self.appBench("stop_path_enter route=\(route.rawValue)")
         let isOnboardingTryout = route == .onboardingSandbox && self.isOnboardingVoicePlaygroundStepActive
@@ -2831,9 +2830,9 @@ struct ContentView: View {
                 && (sendsExistingDraft || !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 && targetMatchesRecordingFocus
                 && !self.isSpokenSendBlockedApp(appInfo)
-            // Dispatch insertion as soon as the destination app is ready. Keep
-            // the current overlay frame intact until delivery completes so UI
-            // work cannot delay paste or briefly redraw a smaller panel.
+            // Submit insertion first, then retire the overlay in this same main
+            // turn. The worker can paste concurrently; dismissal must not queue
+            // behind history notifications or a subsequent SwiftUI render.
             if typingTarget.shouldRestoreOriginalFocus {
                 await self.restoreFocusToRecordingTarget()
             }
@@ -2866,11 +2865,12 @@ struct ContentView: View {
                             pipelineID: pipelineID,
                             pipelineStartedAt: pipelineStartedAt,
                             textReadyAt: finalTextReadyAt,
-                            shouldHideOverlay: shouldHideOverlayAfterDelivery,
+                            shouldHideOverlay: shouldHideOverlayAfterDelivery && spokenSendRequested,
                             expectedOverlayLifecycleID: expectedOverlayLifecycleID
                         )
                     }
                 )
+                self.hideOverlayForDispatchedPaste(shouldHide: shouldHideOverlayAfterDelivery && !spokenSendRequested, lifecycleID: expectedOverlayLifecycleID)
                 didScheduleOverlayHideAfterDelivery = shouldHideOverlayAfterDelivery
                 didTypeExternally = true
             }
@@ -2900,6 +2900,12 @@ struct ContentView: View {
         }
     }
 
+    private func hideOverlayForDispatchedPaste(shouldHide: Bool, lifecycleID: UInt64) {
+        guard shouldHide, self.overlayLifecycleID == lifecycleID else { return }
+        self.appBench("overlay_hide_request reason=paste_dispatched")
+        self.menuBarManager.beginProcessingCompletionAndHideOverlay()
+    }
+
     private func handleTypingDelivery(
         _ outcome: TypingService.DeliveryOutcome,
         pipelineID: String,
@@ -2922,6 +2928,8 @@ struct ContentView: View {
             )
             return
         }
+        // Preserve delivery-timed dismissal for the send-suppressed status path.
+        // Ordinary dictation already hid in the dispatch turn and returns above.
         self.appBench("overlay_hide_request reason=delivery_complete outcome=\(outcome)")
         self.menuBarManager.beginProcessingCompletionAndHideOverlay()
     }
