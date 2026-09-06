@@ -8,6 +8,33 @@ import XCTest
 
 @MainActor
 final class LLMClientRequestBodyTests: XCTestCase {
+    func testDictationStreamingFallbackSkipsTransportFailuresAndCancellation() {
+        XCTAssertFalse(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(
+                after: LLMError.networkError(URLError(.notConnectedToInternet))
+            )
+        )
+        XCTAssertFalse(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(after: CancellationError())
+        )
+        XCTAssertFalse(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(
+                after: LLMError.invalidRequest("missing prompt")
+            )
+        )
+    }
+
+    func testDictationStreamingFallbackRetriesProtocolFailure() {
+        XCTAssertTrue(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(after: LLMError.invalidResponse)
+        )
+        XCTAssertTrue(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(
+                after: LLMError.httpError(400, "streaming unsupported")
+            )
+        )
+    }
+
     private func config(streaming: Bool) -> LLMClient.Config {
         LLMClient.Config(
             messages: [["role": "user", "content": "hello"]],

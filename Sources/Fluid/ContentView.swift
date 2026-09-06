@@ -15,7 +15,7 @@ import SwiftUI
 
 // MARK: - AI Processing Errors
 
-enum AIProcessingError: LocalizedError {
+nonisolated enum AIProcessingError: LocalizedError {
     case noVerifiedProvider
     case missingAPIKey(provider: String)
     case missingModel(provider: String)
@@ -44,6 +44,34 @@ enum AIProcessingError: LocalizedError {
             return true
         case .emptyResponse, .dictationExceedsAIContextWindow:
             return false
+        }
+    }
+}
+
+nonisolated enum DictationAIFailurePresentationPolicy {
+    static func shouldPresent(shouldPersistOutputs: Bool, fallbackReason: String?) -> Bool {
+        shouldPersistOutputs && fallbackReason != nil
+    }
+
+    static func notificationMessage(for error: Error) -> String {
+        if let aiError = error as? AIProcessingError, aiError.isConfigurationError {
+            return "\(aiError.localizedDescription). Open AI Providers to configure a provider."
+        }
+        return error.localizedDescription
+    }
+}
+
+nonisolated enum DictationStreamingFallbackPolicy {
+    static func shouldRetryWithoutStreaming(after error: Error) -> Bool {
+        if error is CancellationError || error is URLError {
+            return false
+        }
+        guard let llmError = error as? LLMError else { return true }
+        switch llmError {
+        case .networkError, .timeout, .invalidURL, .encodingError, .invalidRequest:
+            return false
+        case .invalidResponse, .httpError:
+            return true
         }
     }
 }
@@ -2439,6 +2467,11 @@ struct ContentView: View {
             do {
                 response = try await LLMClient.shared.call(config)
             } catch {
+                guard DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(after: error) else {
+                    self.appBench("ai_streaming_fallback_skipped reason=transport_or_cancel")
+                    throw error
+                }
+                self.appBench("ai_streaming_fallback_start")
                 DebugLogger.shared.warning(
                     "Streaming dictation post-processing failed; retrying without streaming: \(error.localizedDescription)",
                     source: "ContentView"
@@ -2642,6 +2675,7 @@ struct ContentView: View {
         var postProcessingModel: String?
         var aiProcessingDurationMilliseconds: Int?
         var aiTokensPerSecond: Double?
+        var aiFallbackNotificationError: String?
         let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
         let punctuationFormattedText = ASRService.applySpokenPunctuationFormatting(
             transcribedText,
@@ -2714,17 +2748,7 @@ struct ContentView: View {
                     source: "ContentView"
                 )
                 aiFallbackReason = error.localizedDescription
-                // Configuration errors are actionable — point the user at settings
-                // rather than just echoing the technical error string.
-                if let aiError = error as? AIProcessingError,
-                   aiError.isConfigurationError
-                {
-                    NotificationService.showAIProcessingFallback(
-                        error: "\(aiError.localizedDescription). Open AI Providers to configure a provider."
-                    )
-                } else {
-                    NotificationService.showAIProcessingFallback(error: error.localizedDescription)
-                }
+                aiFallbackNotificationError = DictationAIFailurePresentationPolicy.notificationMessage(for: error)
                 finalText = normalizedTranscribedText
             }
             let postProcessingLatencyMs = Int(
@@ -2797,12 +2821,11 @@ struct ContentView: View {
             )
         }
 
-        let shouldShowAIProcessingFailure = shouldPersistOutputs && aiFallbackReason != nil
-        if shouldShowAIProcessingFailure {
-            self.pendingAIReprocessText = spokenSendParse.shouldSend ? normalizedTranscribedText : transcribedText
-            NotchContentState.shared.showAIProcessingFailure()
-            self.menuBarManager.finishProcessingKeepingOverlayVisible()
-        } else {
+        let shouldShowAIProcessingFailure = DictationAIFailurePresentationPolicy.shouldPresent(
+            shouldPersistOutputs: shouldPersistOutputs,
+            fallbackReason: aiFallbackReason
+        )
+        if !shouldShowAIProcessingFailure {
             self.pendingAIReprocessText = nil
         }
 
@@ -2927,6 +2950,17 @@ struct ContentView: View {
             {
                 NotchOverlayManager.shared.updateTranscriptionText("")
                 self.hideOverlayAfterOutput()
+            }
+        }
+
+        // Submit raw fallback delivery before failure UI or notification work can
+        // compete with it on the main actor. Sandbox runs never present either.
+        if shouldShowAIProcessingFailure {
+            self.pendingAIReprocessText = spokenSendParse.shouldSend ? normalizedTranscribedText : transcribedText
+            NotchContentState.shared.showAIProcessingFailure()
+            self.menuBarManager.finishProcessingKeepingOverlayVisible()
+            if let aiFallbackNotificationError {
+                NotificationService.showAIProcessingFallback(error: aiFallbackNotificationError)
             }
         }
 
@@ -3170,6 +3204,7 @@ struct ContentView: View {
         else {
             return
         }
+        let saveGeneration = TranscriptionHistoryStore.shared.audioSaveGeneration
 
         Task.detached(priority: .utility) {
             let result: (metadata: DictationAudioMetadata?, error: String?) = {
@@ -3188,10 +3223,17 @@ struct ContentView: View {
 
             await MainActor.run {
                 if let metadata = result.metadata {
-                    TranscriptionHistoryStore.shared.attachAudio(metadata, to: entryID)
+                    TranscriptionHistoryStore.shared.attachAudio(
+                        metadata,
+                        to: entryID,
+                        expectedSaveGeneration: saveGeneration
+                    )
                 } else if let error = result.error {
                     DebugLogger.shared.error("Failed to save dictation audio: \(error)", source: "ContentView")
                 }
+            }
+            if let metadata = result.metadata {
+                DictationAudioHistoryStore.shared.completePendingSave(fileName: metadata.fileName)
             }
         }
     }
@@ -3450,12 +3492,12 @@ struct ContentView: View {
         self.setActiveRecordingMode(.dictate)
         self.menuBarManager.setProcessing(true)
         NotchOverlayManager.shared.updateTranscriptionText("Reprocessing...")
-        await Task.yield()
 
         var aiFallbackReason: String?
         var postProcessingModel: String?
         var aiProcessingDurationMilliseconds: Int?
         var aiTokensPerSecond: Double?
+        var aiFallbackNotificationError: String?
         let appInfo = self.getCurrentAppInfo()
         let normalizedTranscribedText = ASRService.applySpokenPunctuationFormatting(
             transcribedText,
@@ -3484,15 +3526,13 @@ struct ContentView: View {
                     source: "ContentView"
                 )
                 aiFallbackReason = error.localizedDescription
-                NotificationService.showAIProcessingFallback(error: error.localizedDescription)
+                aiFallbackNotificationError = DictationAIFailurePresentationPolicy.notificationMessage(for: error)
                 finalText = normalizedTranscribedText
             }
             aiProcessingDurationMilliseconds = Int(
                 ((ProcessInfo.processInfo.systemUptime - postProcessingStart) * 1000).rounded()
             )
         }
-
-        NotchOverlayManager.shared.updateTranscriptionText("")
 
         finalText = ASRService.applyDictationLiteralFormatting(
             finalText,
@@ -3532,11 +3572,11 @@ struct ContentView: View {
                 aiProcessingError: aiFallbackReason
             )
         }
-        if aiFallbackReason != nil {
-            self.pendingAIReprocessText = transcribedText
-            NotchContentState.shared.showAIProcessingFailure()
-            self.menuBarManager.finishProcessingKeepingOverlayVisible()
-        } else {
+        let shouldShowAIProcessingFailure = DictationAIFailurePresentationPolicy.shouldPresent(
+            shouldPersistOutputs: true,
+            fallbackReason: aiFallbackReason
+        )
+        if !shouldShowAIProcessingFailure {
             self.pendingAIReprocessText = nil
         }
 
@@ -3562,7 +3602,15 @@ struct ContentView: View {
             )
         }
 
-        if aiFallbackReason == nil {
+        NotchOverlayManager.shared.updateTranscriptionText("")
+        if shouldShowAIProcessingFailure {
+            self.pendingAIReprocessText = transcribedText
+            NotchContentState.shared.showAIProcessingFailure()
+            self.menuBarManager.finishProcessingKeepingOverlayVisible()
+            if let aiFallbackNotificationError {
+                NotificationService.showAIProcessingFallback(error: aiFallbackNotificationError)
+            }
+        } else {
             self.hideOverlayAfterOutput()
         }
 

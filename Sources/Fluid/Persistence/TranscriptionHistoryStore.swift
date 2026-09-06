@@ -9,6 +9,15 @@ import AppKit
 import Combine
 import Foundation
 
+nonisolated struct AudioBudgetMeasurementGate: Equatable, Sendable {
+    let revision: UInt64
+    let budgetBytes: Int64
+
+    func accepts(currentRevision: UInt64, currentBudgetBytes: Int64) -> Bool {
+        self.revision == currentRevision && self.budgetBytes == currentBudgetBytes
+    }
+}
+
 // MARK: - Transcription History Entry Model
 
 struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
@@ -217,6 +226,9 @@ final class TranscriptionHistoryStore: ObservableObject {
     private var todaySummaryTask: Task<Void, Never>?
     private var todaySummaryRevision: UInt64 = 0
     private var todaySummaryDay: DateInterval?
+    private var audioBudgetRevision: UInt64 = 0
+    private var automaticAudioBudgetTask: Task<Void, Never>?
+    private(set) var audioSaveGeneration: UInt64 = 0
     private var calendarObservers: [NSObjectProtocol] = []
     private let summaryNow: () -> Date
     private let summaryCalendar: () -> Calendar
@@ -292,7 +304,7 @@ final class TranscriptionHistoryStore: ObservableObject {
 
         self.persist(upserts: [entry])
         if audio != nil {
-            self.pruneAudioToBudget()
+            self.scheduleAutomaticAudioPruneToBudget()
         }
 
         DebugLogger.shared.debug("Added transcription to history (total: \(self.entries.count))", source: "TranscriptionHistoryStore")
@@ -300,6 +312,7 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     /// Delete a specific entry
     func deleteEntry(id: UUID) {
+        self.invalidateAutomaticAudioBudgetMeasurement()
         if let audio = self.entries.first(where: { $0.id == id })?.audio {
             DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
         }
@@ -319,6 +332,7 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     /// Delete multiple entries
     func deleteEntries(ids: Set<UUID>) {
+        self.invalidateAutomaticAudioBudgetMeasurement()
         for entry in self.entries where ids.contains(entry.id) {
             if let audio = entry.audio {
                 DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
@@ -339,6 +353,8 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     /// Clear all history
     func clearAllHistory() {
+        self.audioSaveGeneration &+= 1
+        self.invalidateAutomaticAudioBudgetMeasurement()
         DictationAudioHistoryStore.shared.deleteAllAudioFiles()
         self.entries.removeAll()
         self.refreshTodaySummary()
@@ -383,25 +399,37 @@ final class TranscriptionHistoryStore: ObservableObject {
     }
 
     func restore(from payload: [TranscriptionHistoryEntry]) {
+        self.audioSaveGeneration &+= 1
+        self.invalidateAutomaticAudioBudgetMeasurement()
         self.entries = payload.sorted { $0.timestamp > $1.timestamp }
         self.refreshTodaySummary()
         self.selectedEntryID = self.entries.first?.id
         self.persist(upserts: self.entries, replacing: true)
     }
 
-    func attachAudio(_ audio: DictationAudioMetadata, to entryID: UUID) {
+    func attachAudio(
+        _ audio: DictationAudioMetadata,
+        to entryID: UUID,
+        expectedSaveGeneration: UInt64? = nil
+    ) {
+        if let expectedSaveGeneration, expectedSaveGeneration != self.audioSaveGeneration {
+            DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
+            return
+        }
         guard let index = self.entries.firstIndex(where: { $0.id == entryID }) else {
             DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
             return
         }
         self.entries[index] = self.entries[index].replacingAudio(audio)
         self.persist(upserts: [self.entries[index]])
-        self.pruneAudioToBudget()
+        self.scheduleAutomaticAudioPruneToBudget()
     }
 
     @discardableResult
     func deleteAllSavedAudio() -> Int {
         guard self.hasLoaded else { return 0 }
+        self.audioSaveGeneration &+= 1
+        self.invalidateAutomaticAudioBudgetMeasurement()
         let removedCount = self.entries.filter { $0.audio != nil }.count
         DictationAudioHistoryStore.shared.deleteAllAudioFiles()
         let changed = self.entries.filter { $0.audio != nil }.map { $0.replacingAudio(nil) }
@@ -415,12 +443,18 @@ final class TranscriptionHistoryStore: ObservableObject {
     func pruneAudioToBudget() -> Int {
         // An incomplete startup snapshot must never classify older recordings as orphaned.
         guard self.hasLoaded else { return 0 }
+        self.invalidateAutomaticAudioBudgetMeasurement()
         let budgetBytes = SettingsStore.shared.audioHistoryBudgetBytes
+        let currentBytes = DictationAudioHistoryStore.shared.audioUsageBytes()
+        return self.pruneAudioToBudget(currentBytes: currentBytes, budgetBytes: budgetBytes)
+    }
+
+    private func pruneAudioToBudget(currentBytes initialCurrentBytes: Int64, budgetBytes: Int64) -> Int {
         guard budgetBytes > 0 else {
             return self.deleteAllSavedAudio()
         }
 
-        var currentBytes = DictationAudioHistoryStore.shared.audioUsageBytes()
+        var currentBytes = initialCurrentBytes
         guard currentBytes > budgetBytes else { return 0 }
 
         var updatedEntries = self.entries
@@ -452,6 +486,41 @@ final class TranscriptionHistoryStore: ObservableObject {
             DebugLogger.shared.info("Pruned saved dictation audio (\(prunedCount) entries)", source: "TranscriptionHistoryStore")
         }
         return prunedCount
+    }
+
+    private func invalidateAutomaticAudioBudgetMeasurement() {
+        self.audioBudgetRevision &+= 1
+    }
+
+    private func scheduleAutomaticAudioPruneToBudget() {
+        self.audioBudgetRevision &+= 1
+        guard self.hasLoaded, self.automaticAudioBudgetTask == nil else { return }
+
+        self.automaticAudioBudgetTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while true {
+                let gate = AudioBudgetMeasurementGate(
+                    revision: self.audioBudgetRevision,
+                    budgetBytes: SettingsStore.shared.audioHistoryBudgetBytes
+                )
+                let currentBytes = await Task.detached(priority: .utility) {
+                    DictationAudioHistoryStore.shared.audioUsageBytes()
+                }.value
+                guard gate.accepts(
+                    currentRevision: self.audioBudgetRevision,
+                    currentBudgetBytes: SettingsStore.shared.audioHistoryBudgetBytes
+                ) else {
+                    continue
+                }
+
+                _ = self.pruneAudioToBudget(
+                    currentBytes: currentBytes,
+                    budgetBytes: gate.budgetBytes
+                )
+                self.automaticAudioBudgetTask = nil
+                return
+            }
+        }
     }
 
     // MARK: - Private Methods
