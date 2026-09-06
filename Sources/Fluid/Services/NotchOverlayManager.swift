@@ -316,10 +316,48 @@ final class NotchOverlayManager {
         self.generation &+= 1
         let currentGeneration = self.generation
         self.activeHideGeneration = currentGeneration
+        if self.isBottomOverlayVisible {
+            BottomOverlayWindowController.shared.hide()
+        }
         Task { [weak self] in
             guard let self else { return }
             let outcome = await self.performHideAndWait(generation: currentGeneration)
             self.completeHideOperation(generation: currentGeneration, outcome: outcome)
+        }
+    }
+
+    /// Removes a successfully completed recording overlay synchronously so it
+    /// cannot outlive the text insertion that follows.
+    func hideImmediately() {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        self.generation &+= 1
+        let currentGeneration = self.generation
+
+        self.activeHideGeneration = nil
+        self.isHideInProgress = false
+        let waiters = self.hideWaiters
+        self.hideWaiters.removeAll(keepingCapacity: true)
+
+        if self.isBottomOverlayVisible {
+            BottomOverlayWindowController.shared.hideImmediately()
+            self.isBottomOverlayVisible = false
+        }
+
+        if self.notch != nil || self.state != .idle {
+            self.retireCurrentNotchImmediately(reason: "completed_output")
+        }
+
+        waiters.forEach { $0.resume(returning: .hidden) }
+        Self.overlayBench("hide_immediate_complete elapsedMs=\(Self.elapsedMs(since: startedAt))")
+
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, self.generation == currentGeneration else { return }
+            ActiveAppMonitor.shared.stopMonitoring()
+            NotchContentState.shared.setProcessing(false)
+            NotchContentState.shared.updateTranscription("")
+            NotchContentState.shared.setSpokenSendIndicatorState(.hidden)
+            Self.overlayBench("hide_immediate_cleanup_complete")
         }
     }
 

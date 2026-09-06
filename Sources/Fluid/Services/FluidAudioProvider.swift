@@ -350,7 +350,15 @@ final class FluidAudioProvider: TranscriptionProvider {
     }
 
     func transcribeFinal(_ samples: [Float]) async throws -> ASRTranscriptionResult {
-        defer { self.resetIncrementalSession() }
+        defer {
+            let resetStartedAt = ProcessInfo.processInfo.systemUptime
+            self.resetIncrementalSession()
+            let resetFinishedAt = ProcessInfo.processInfo.systemUptime
+            DebugLogger.shared.info(
+                "ASR_BENCH t=\(resetFinishedAt) incremental_reset_done elapsedMs=\((resetFinishedAt - resetStartedAt) * 1000)",
+                source: "ASRBenchmark"
+            )
+        }
         guard let manager = self.finalAsrManager ?? self.streamingAsrManager else {
             throw NSError(
                 domain: "FluidAudioProvider",

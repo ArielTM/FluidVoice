@@ -407,17 +407,26 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         }
     }
 
+    /// Removes the successful recording overlay after insertion completes. There
+    /// is intentionally no separate exit animation on this latency-critical path.
+    func beginProcessingCompletionAndHideOverlay() {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        self.prepareForProcessingCompletion()
+        self.overlayBench("finish_hide_request mode=immediate")
+        NotchOverlayManager.shared.hideImmediately()
+        self.overlayBench(
+            "finish_hide_complete mode=immediate elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
+        )
+    }
+
     /// Ends processing and waits for the recording overlay's exit transition.
-    /// Output paths normally call this asynchronously after insertion dispatch
-    /// so the exit animation cannot delay text delivery.
+    /// Use only when the caller must know the overlay has fully disappeared.
     func finishProcessingAndHideOverlay() async {
         let startedAt = ProcessInfo.processInfo.systemUptime
-        self.cancelPendingProcessingCompletionOperations()
-        self.isProcessingActive = false
-        self.overlayVisible = false
+        self.prepareForProcessingCompletion()
 
         NotchOverlayManager.shared.setProcessing(false)
-        self.overlayBench("finish_hide_request")
+        self.overlayBench("finish_hide_request mode=awaited")
         let hideOutcome = await NotchOverlayManager.shared.hideAndWait()
         self.overlayBench(
             "finish_hide_complete outcome=\(hideOutcome) elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
@@ -443,6 +452,12 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         self.pendingHideOperation = nil
         self.pendingShowOperation?.cancel()
         self.pendingShowOperation = nil
+    }
+
+    private func prepareForProcessingCompletion() {
+        self.cancelPendingProcessingCompletionOperations()
+        self.isProcessingActive = false
+        self.overlayVisible = false
     }
 
     private func overlayBench(_ message: String) {

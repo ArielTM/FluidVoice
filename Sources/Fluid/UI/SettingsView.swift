@@ -1605,7 +1605,7 @@ struct SettingsView: View {
 
             guard panel.runModal() == .OK, let url = panel.url else { return }
 
-            let document = await BackupService.shared.makeBackupDocument()
+            let document = try await BackupService.shared.makeBackupDocument()
             let data = try BackupService.shared.encode(document)
             try data.write(to: url, options: .atomic)
 

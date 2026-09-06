@@ -29,6 +29,11 @@ struct HistoryAPIController: LocalAPIRouteHandler {
         }
 
         let limit = LocalAPI.boundedLimit(from: request)
+        do {
+            try await TranscriptionHistoryStore.shared.waitUntilLoaded()
+        } catch {
+            return LocalAPI.error("History is unavailable. Retry from History in FluidVoice.", status: 503)
+        }
         let items = TranscriptionHistoryStore.shared.entries
             .prefix(limit)
             .map { entry in

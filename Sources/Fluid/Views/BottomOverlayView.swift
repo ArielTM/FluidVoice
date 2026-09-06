@@ -56,6 +56,9 @@ final class BottomOverlayWindowController {
     private var isHideInProgress = false
     private var activeHideGeneration: UInt64?
     private var hideWaiters: [CheckedContinuation<RecordingOverlayHideOutcome, Never>] = []
+    var isVisuallyHiddenForTests: Bool {
+        self.window?.isVisible != true || self.window?.alphaValue == 0
+    }
 
     private init() {
         NotificationCenter.default.addObserver(forName: NSNotification.Name("OverlayOffsetChanged"), object: nil, queue: .main) { [weak self] _ in
@@ -163,11 +166,55 @@ final class BottomOverlayWindowController {
         self.presentationGeneration &+= 1
         let currentGeneration = self.presentationGeneration
         self.activeHideGeneration = currentGeneration
+        self.beginDismissalVisualIfPresented(generation: currentGeneration)
         Task { [weak self] in
             guard let self else { return }
             let outcome = await self.performHideAndWait(generation: currentGeneration)
             self.completeHideOperation(generation: currentGeneration, outcome: outcome)
         }
+    }
+
+    /// Removes the completed-dictation overlay before returning. The panel is
+    /// parked rather than destroyed so the next presentation keeps its warm
+    /// SwiftUI and WindowServer surface.
+    func hideImmediately() {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        self.presentationGeneration &+= 1
+        let currentGeneration = self.presentationGeneration
+
+        self.activeHideGeneration = nil
+        self.isHideInProgress = false
+        let waiters = self.hideWaiters
+        self.hideWaiters.removeAll(keepingCapacity: true)
+
+        // Remove the panel from WindowServer before any SwiftUI state update can
+        // delay paste. Opacity alone is not committed until the next frame.
+        self.window?.alphaValue = 0
+        self.window?.orderOut(nil)
+        waiters.forEach { $0.resume(returning: .hidden) }
+
+        Self.overlayBench(
+            "bottom_hide_immediate_complete elapsedMs=\(Self.elapsedMs(since: startedAt)) visible=\(self.window?.isVisible == true)"
+        )
+
+        // Cleanup is not user-visible and must not hold up text insertion.
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, self.presentationGeneration == currentGeneration else { return }
+            self.clearPresentationStateAfterImmediateHide()
+            self.parkWindowOffscreen()
+            self.window?.alphaValue = 1
+            self.window?.orderFrontRegardless()
+        }
+    }
+
+    private func clearPresentationStateAfterImmediateHide() {
+        NotchContentState.shared.setBottomOverlayPresented(false)
+        self.endReleaseTransition(flushDeferredUpdate: false)
+        NotchContentState.shared.setBottomOverlayDismissing(false)
+        NotchContentState.shared.targetAppIcon = nil
+        self.clearPresentationResources()
+        Self.overlayBench("bottom_hide_immediate_cleanup_complete")
     }
 
     /// Returns whether the panel finished hiding or a newer presentation
@@ -183,6 +230,7 @@ final class BottomOverlayWindowController {
         self.presentationGeneration &+= 1
         let currentGeneration = self.presentationGeneration
         self.activeHideGeneration = currentGeneration
+        self.beginDismissalVisualIfPresented(generation: currentGeneration)
         let outcome = await self.performHideAndWait(generation: currentGeneration)
         self.completeHideOperation(generation: currentGeneration, outcome: outcome)
         return outcome
@@ -224,10 +272,6 @@ final class BottomOverlayWindowController {
             return .hidden
         }
 
-        NotchContentState.shared.setBottomOverlayReleaseTransitioning(true)
-        NotchContentState.shared.setBottomOverlayDismissOffsetY(8)
-        NotchContentState.shared.setBottomOverlayDismissing(true)
-
         // SwiftUI owns the dismissal animation. Keeping AppKit alpha at 1
         // prevents an old implicit window animation from hiding a rapid restart.
         Self.overlayBench("bottom_hide_animation_start")
@@ -253,6 +297,18 @@ final class BottomOverlayWindowController {
         NotchContentState.shared.targetAppIcon = nil
         Self.overlayBench("bottom_hide_complete elapsedMs=\(Self.elapsedMs(since: startedAt))")
         return .hidden
+    }
+
+    private func beginDismissalVisualIfPresented(generation: UInt64) {
+        guard self.presentationGeneration == generation,
+              self.window != nil,
+              NotchContentState.shared.isBottomOverlayPresented
+        else { return }
+
+        NotchContentState.shared.setBottomOverlayReleaseTransitioning(true)
+        NotchContentState.shared.setBottomOverlayDismissOffsetY(8)
+        NotchContentState.shared.setBottomOverlayDismissing(true)
+        Self.overlayBench("bottom_hide_visual_requested")
     }
 
     private func clearPresentationResources() {

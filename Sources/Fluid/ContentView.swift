@@ -2434,6 +2434,12 @@ struct ContentView: View {
     // MARK: - Stop and Process Transcription
 
     private func stopAndProcessTranscription(route: DictationOutputRoute = .normal) async {
+        let pipelineStartedAt = ProcessInfo.processInfo.systemUptime
+        let pipelineID = UUID().uuidString
+        self.appBench("pipeline_begin id=\(pipelineID) route=\(route.rawValue)")
+        defer {
+            self.appBench("pipeline_handler_return id=\(pipelineID) elapsedMs=\((ProcessInfo.processInfo.systemUptime - pipelineStartedAt) * 1000) deliveryMayBePending=true")
+        }
         DebugLogger.shared.debug("stopAndProcessTranscription called", source: "ContentView")
         DebugLogger.shared.info("Output route selected: \(route.rawValue)", source: "ContentView")
         self.appBench("stop_path_enter route=\(route.rawValue)")
@@ -2498,10 +2504,10 @@ struct ContentView: View {
             source: "ContentView"
         )
 
-        // Reset the transcription text display after transcription completes
-        NotchOverlayManager.shared.updateTranscriptionText("")
-
         guard transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            // Empty results have no delivery callback, so clear their stale
+            // preview before the existing empty-result dismissal path runs.
+            NotchOverlayManager.shared.updateTranscriptionText("")
             DebugLogger.shared.debug("Transcription returned empty text", source: "ContentView")
             if isOnboardingTryout {
                 if self.asr.lastStopOutcome == .failed {
@@ -2654,6 +2660,7 @@ struct ContentView: View {
             }
 
             do {
+                self.appBench("ai_process_call id=\(pipelineID)")
                 let result = try await self.processTextWithAIMetrics(
                     normalizedTranscribedText,
                     overrideSystemPrompt: promptOverride,
@@ -2661,8 +2668,10 @@ struct ContentView: View {
                     streamHandler: streamHandler
                 )
                 finalText = result.text
+                self.appBench("ai_process_return id=\(pipelineID)")
                 aiTokensPerSecond = result.tokensPerSecond
                 await streamPreview.flush()
+                self.appBench("ai_preview_flushed id=\(pipelineID)")
             } catch {
                 // Fall back to the raw transcription so the user still gets
                 // their words typed instead of an error string.
@@ -2696,10 +2705,6 @@ struct ContentView: View {
                     + "inputChars=\(postProcessingInputChars) fallback=\(aiFallbackReason != nil)",
                 source: "ContentView"
             )
-            // Clear transient status text before leaving processing state to avoid
-            // a brief non-shimmer "Refining..." preview flash.
-            NotchOverlayManager.shared.updateTranscriptionText("")
-
         } else {
             finalText = normalizedTranscribedText
         }
@@ -2748,6 +2753,7 @@ struct ContentView: View {
         )
         self.appBench("transcription_finalized chars=\(finalText.count)")
         self.appBench("text_ready chars=\(finalText.count)")
+        self.appBench("pipeline_text_ready id=\(pipelineID) stopToReadyMs=\((finalTextReadyAt - pipelineStartedAt) * 1000)")
 
         let shouldPersistOutputs = route == .normal
         if !shouldPersistOutputs {
@@ -2807,6 +2813,7 @@ struct ContentView: View {
         }
 
         var didTypeExternally = false
+        var didScheduleOverlayHideAfterDelivery = false
         let shouldTypeExternally = shouldPersistOutputs && !isFluidFrontmost
 
         DebugLogger.shared.debug(
@@ -2824,8 +2831,9 @@ struct ContentView: View {
                 && (sendsExistingDraft || !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 && targetMatchesRecordingFocus
                 && !self.isSpokenSendBlockedApp(appInfo)
-            // Dispatch insertion as soon as the destination app is ready; the
-            // overlay hides asynchronously after output so it cannot delay paste.
+            // Dispatch insertion as soon as the destination app is ready. Keep
+            // the current overlay frame intact until delivery completes so UI
+            // work cannot delay paste or briefly redraw a smaller panel.
             if typingTarget.shouldRestoreOriginalFocus {
                 await self.restoreFocusToRecordingTarget()
             }
@@ -2844,12 +2852,26 @@ struct ContentView: View {
                 )
                 didTypeExternally = deliveryOutcome.didInsert
             } else {
+                let expectedOverlayLifecycleID = self.overlayLifecycleID
+                let shouldHideOverlayAfterDelivery = !shouldShowAIProcessingFailure
+                    && !didRequestOverlayHideOnStop
                 self.asr.typeOutputPlanToActiveField(
                     finalOutputPlan,
                     preferredTargetPID: typingTarget.pid,
                     textReadyAt: finalTextReadyAt,
-                    tracksDictionaryCorrections: true
+                    tracksDictionaryCorrections: true,
+                    completion: { outcome in
+                        self.handleTypingDelivery(
+                            outcome,
+                            pipelineID: pipelineID,
+                            pipelineStartedAt: pipelineStartedAt,
+                            textReadyAt: finalTextReadyAt,
+                            shouldHideOverlay: shouldHideOverlayAfterDelivery,
+                            expectedOverlayLifecycleID: expectedOverlayLifecycleID
+                        )
+                    }
                 )
+                didScheduleOverlayHideAfterDelivery = shouldHideOverlayAfterDelivery
                 didTypeExternally = true
             }
             if spokenSendRequested, !spokenSendAllowed {
@@ -2863,9 +2885,12 @@ struct ContentView: View {
                     try? await Task.sleep(nanoseconds: 650_000_000)
                 }
             }
-            NotchOverlayManager.shared.updateTranscriptionText("")
             NotchContentState.shared.setSpokenSendIndicatorState(.hidden)
-            if !shouldShowAIProcessingFailure, !didRequestOverlayHideOnStop {
+            if !shouldShowAIProcessingFailure,
+               !didRequestOverlayHideOnStop,
+               !didScheduleOverlayHideAfterDelivery
+            {
+                NotchOverlayManager.shared.updateTranscriptionText("")
                 self.hideOverlayAfterOutput()
             }
         }
@@ -2873,6 +2898,32 @@ struct ContentView: View {
         if !didTypeExternally, !shouldShowAIProcessingFailure, !didRequestOverlayHideOnStop {
             self.hideOverlayAfterOutput()
         }
+    }
+
+    private func handleTypingDelivery(
+        _ outcome: TypingService.DeliveryOutcome,
+        pipelineID: String,
+        pipelineStartedAt: TimeInterval,
+        textReadyAt: TimeInterval,
+        shouldHideOverlay: Bool,
+        expectedOverlayLifecycleID: UInt64
+    ) {
+        let finishedAt = ProcessInfo.processInfo.systemUptime
+        DebugLogger.shared.info(
+            "PIPELINE_SUMMARY id=\(pipelineID) t=\(finishedAt) " +
+                "stopToReadyMs=\((textReadyAt - pipelineStartedAt) * 1000) readyToDeliveryMs=\((finishedAt - textReadyAt) * 1000) " +
+                "totalMs=\((finishedAt - pipelineStartedAt) * 1000) outcome=\(outcome)",
+            source: "AppBenchmark"
+        )
+        guard shouldHideOverlay else { return }
+        guard self.overlayLifecycleID == expectedOverlayLifecycleID else {
+            self.appBench(
+                "overlay_hide_skipped reason=delivery_complete staleLifecycle=\(expectedOverlayLifecycleID) currentLifecycle=\(self.overlayLifecycleID)"
+            )
+            return
+        }
+        self.appBench("overlay_hide_request reason=delivery_complete outcome=\(outcome)")
+        self.menuBarManager.beginProcessingCompletionAndHideOverlay()
     }
 
     private func hideOverlayAfterOutput() {

@@ -10,7 +10,7 @@ import Foundation
 
 // MARK: - Transcription History Entry Model
 
-struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
+struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
     let id: UUID
     let timestamp: Date
     let rawText: String
@@ -199,16 +199,20 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
 final class TranscriptionHistoryStore: ObservableObject {
     static let shared = TranscriptionHistoryStore()
 
-    private let defaults = UserDefaults.standard
-
-    private enum Keys {
-        static let transcriptionHistory = "TranscriptionHistoryEntries"
-    }
+    private let writer: TranscriptionHistoryWriter
+    private var loadTask: Task<Void, Never>?
+    private var hasLoaded = false
+    private var pendingUpserts: [UUID: TranscriptionHistoryEntry] = [:]
+    private var pendingDeletes: Set<UUID> = []
+    private var pendingReplacement = false
+    @Published private(set) var isLoading = true
+    @Published private(set) var persistenceError: String?
 
     @Published private(set) var entries: [TranscriptionHistoryEntry] = []
     @Published var selectedEntryID: UUID?
 
-    private init() {
+    init(writer: TranscriptionHistoryWriter = TranscriptionHistoryWriter()) {
+        self.writer = writer
         self.loadEntries()
     }
 
@@ -262,7 +266,7 @@ final class TranscriptionHistoryStore: ObservableObject {
         // Insert at beginning (newest first)
         self.entries.insert(entry, at: 0)
 
-        self.saveEntries()
+        self.persist(upserts: [entry])
         if audio != nil {
             self.pruneAudioToBudget()
         }
@@ -282,7 +286,7 @@ final class TranscriptionHistoryStore: ObservableObject {
             self.selectedEntryID = self.entries.first?.id
         }
 
-        self.saveEntries()
+        self.persist(deletes: [id])
     }
 
     /// Delete multiple entries
@@ -298,7 +302,7 @@ final class TranscriptionHistoryStore: ObservableObject {
             self.selectedEntryID = self.entries.first?.id
         }
 
-        self.saveEntries()
+        self.persist(deletes: Array(ids))
     }
 
     /// Clear all history
@@ -306,7 +310,7 @@ final class TranscriptionHistoryStore: ObservableObject {
         DictationAudioHistoryStore.shared.deleteAllAudioFiles()
         self.entries.removeAll()
         self.selectedEntryID = nil
-        self.saveEntries()
+        self.persist(replacing: true)
 
         DebugLogger.shared.info("Cleared all transcription history", source: "TranscriptionHistoryStore")
     }
@@ -348,7 +352,7 @@ final class TranscriptionHistoryStore: ObservableObject {
     func restore(from payload: [TranscriptionHistoryEntry]) {
         self.entries = payload.sorted { $0.timestamp > $1.timestamp }
         self.selectedEntryID = self.entries.first?.id
-        self.saveEntries()
+        self.persist(upserts: self.entries, replacing: true)
     }
 
     func attachAudio(_ audio: DictationAudioMetadata, to entryID: UUID) {
@@ -357,22 +361,26 @@ final class TranscriptionHistoryStore: ObservableObject {
             return
         }
         self.entries[index] = self.entries[index].replacingAudio(audio)
-        self.saveEntries()
+        self.persist(upserts: [self.entries[index]])
         self.pruneAudioToBudget()
     }
 
     @discardableResult
     func deleteAllSavedAudio() -> Int {
+        guard self.hasLoaded else { return 0 }
         let removedCount = self.entries.filter { $0.audio != nil }.count
         DictationAudioHistoryStore.shared.deleteAllAudioFiles()
+        let changed = self.entries.filter { $0.audio != nil }.map { $0.replacingAudio(nil) }
         self.entries = self.entries.map { $0.replacingAudio(nil) }
-        self.saveEntries()
+        self.persist(upserts: changed)
         DebugLogger.shared.info("Deleted saved dictation audio (\(removedCount) entries)", source: "TranscriptionHistoryStore")
         return removedCount
     }
 
     @discardableResult
     func pruneAudioToBudget() -> Int {
+        // An incomplete startup snapshot must never classify older recordings as orphaned.
+        guard self.hasLoaded else { return 0 }
         let budgetBytes = SettingsStore.shared.audioHistoryBudgetBytes
         guard budgetBytes > 0 else {
             return self.deleteAllSavedAudio()
@@ -391,11 +399,13 @@ final class TranscriptionHistoryStore: ObservableObject {
         guard currentBytes > budgetBytes else { return 0 }
 
         var prunedCount = 0
+        var changed: [TranscriptionHistoryEntry] = []
         for index in updatedEntries.indices.reversed() {
             guard let audio = updatedEntries[index].audio else { continue }
             let removedBytes = DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
             currentBytes = max(0, currentBytes - removedBytes)
             updatedEntries[index] = updatedEntries[index].replacingAudio(nil)
+            changed.append(updatedEntries[index])
             prunedCount += 1
             if currentBytes <= budgetBytes {
                 break
@@ -404,7 +414,7 @@ final class TranscriptionHistoryStore: ObservableObject {
 
         if prunedCount > 0 {
             self.entries = updatedEntries
-            self.saveEntries()
+            self.persist(upserts: changed)
             DebugLogger.shared.info("Pruned saved dictation audio (\(prunedCount) entries)", source: "TranscriptionHistoryStore")
         }
         return prunedCount
@@ -413,20 +423,84 @@ final class TranscriptionHistoryStore: ObservableObject {
     // MARK: - Private Methods
 
     private func loadEntries() {
-        guard let data = defaults.data(forKey: Keys.transcriptionHistory),
-              let decoded = try? JSONDecoder().decode([TranscriptionHistoryEntry].self, from: data)
-        else {
-            self.entries = []
-            return
+        self.isLoading = true
+        self.loadTask = Task { @MainActor in
+            do {
+                let loaded = try await self.writer.load()
+                var merged = self.pendingReplacement ? [] : loaded.filter { !self.pendingDeletes.contains($0.id) && self.pendingUpserts[$0.id] == nil }
+                merged.append(contentsOf: self.pendingUpserts.values)
+                self.entries = merged.sorted { $0.timestamp > $1.timestamp }
+                self.hasLoaded = true
+                self.persistenceError = nil
+                if self.pendingReplacement || !self.pendingUpserts.isEmpty || !self.pendingDeletes.isEmpty {
+                    self.persist(upserts: Array(self.pendingUpserts.values), deletes: Array(self.pendingDeletes), replacing: self.pendingReplacement)
+                }
+                self.pendingUpserts.removeAll()
+                self.pendingDeletes.removeAll()
+                self.pendingReplacement = false
+            } catch {
+                self.persistenceError = "History could not be loaded. New dictations are kept in memory until you retry. \(error.localizedDescription)"
+            }
+            self.isLoading = false
         }
-        self.entries = decoded
     }
 
-    private func saveEntries() {
-        if let encoded = try? JSONEncoder().encode(entries) {
-            self.defaults.set(encoded, forKey: Keys.transcriptionHistory)
+    /// Only immutable changed entries cross to the writer. No full-history encoding on the main actor.
+    private func persist(upserts: [TranscriptionHistoryEntry] = [], deletes: [UUID] = [], replacing: Bool = false) {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        guard self.hasLoaded else {
+            if replacing {
+                self.pendingReplacement = true
+                self.pendingUpserts.removeAll()
+                self.pendingDeletes.removeAll()
+            }
+            for id in deletes {
+                self.pendingUpserts.removeValue(forKey: id)
+                self.pendingDeletes.insert(id)
+            }
+            for entry in upserts {
+                self.pendingDeletes.remove(entry.id)
+                self.pendingUpserts[entry.id] = entry
+            }
+            return
         }
-        objectWillChange.send()
+        self.writer.write(upserts: upserts, deletes: deletes, replacing: replacing) { error in
+            guard let error else { return }
+            Task { @MainActor in
+                self.persistenceError = "History could not be saved. Keep FluidVoice open and retry. \(error.localizedDescription)"
+            }
+        }
+        DebugLogger.shared.info(
+            "HISTORY_BENCH enqueueMs=\((ProcessInfo.processInfo.systemUptime - startedAt) * 1000) upserts=\(upserts.count) deletes=\(deletes.count)",
+            source: "TranscriptionHistoryStore"
+        )
+    }
+
+    func retryPersistence() {
+        guard !self.isLoading else { return }
+        guard self.hasLoaded else {
+            self.loadEntries()
+            return
+        }
+        self.writer.write(upserts: self.entries, replacing: true) { error in
+            Task { @MainActor in
+                self.persistenceError = error.map { "History could not be saved. \($0.localizedDescription)" }
+            }
+        }
+    }
+
+    func waitUntilLoaded() async throws {
+        await self.loadTask?.value
+        guard self.hasLoaded else {
+            throw NSError(domain: "HistoryPersistence", code: 1, userInfo: [NSLocalizedDescriptionKey: self.persistenceError ?? "History is unavailable."])
+        }
+    }
+
+    func finishPendingWrites() async {
+        await self.loadTask?.value
+        if let error = await self.writer.drain() {
+            self.persistenceError = "History could not be saved. Keep FluidVoice open and retry. \(error.localizedDescription)"
+        }
     }
 }
 

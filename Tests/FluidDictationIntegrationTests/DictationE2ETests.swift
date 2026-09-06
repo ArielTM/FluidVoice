@@ -2823,7 +2823,7 @@ extension DictationE2ETests {
         ]
         settings.spokenFormattingActionRules = backedUpRules
 
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         let encoded = try BackupService.shared.encode(document)
         let decoded = try BackupService.shared.decode(encoded)
         XCTAssertEqual(decoded.settings.spokenFormattingActionRules, settings.spokenFormattingActionRules)

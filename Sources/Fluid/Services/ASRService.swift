@@ -39,6 +39,190 @@ private actor TranscriptionExecutor {
     }
 }
 
+private nonisolated func logStreamingProviderOperationReturn(
+    sessionID: Int,
+    operationID: UUID,
+    route: String
+) {
+    let returnedAt = ProcessInfo.processInfo.systemUptime
+    DebugLogger.shared.info(
+        "ASR_BENCH t=\(returnedAt) streaming_provider_operation_return " +
+            "session=\(sessionID) operation=\(operationID.uuidString) route=\(route)",
+        source: "ASRBenchmark"
+    )
+}
+
+/// Identifies the recording and provider generation allowed to publish a live preview.
+/// Operation completion uses the narrower operation identity so stale cleanup cannot
+/// clear state owned by a newer chunk.
+struct StreamingTranscriptionWorkState {
+    private(set) var sessionID: Int?
+    private(set) var activeOperationID: UUID?
+    private(set) var providerGeneration: UInt64 = 0
+
+    mutating func beginSession(_ sessionID: Int) {
+        self.sessionID = sessionID
+        self.activeOperationID = nil
+    }
+
+    mutating func beginOperation(
+        sessionID: Int,
+        operationID: UUID
+    ) -> UInt64? {
+        guard self.sessionID == sessionID, self.activeOperationID == nil else { return nil }
+        self.activeOperationID = operationID
+        return self.providerGeneration
+    }
+
+    func ownsOperation(sessionID: Int, operationID: UUID) -> Bool {
+        self.sessionID == sessionID && self.activeOperationID == operationID
+    }
+
+    func canPublish(
+        sessionID: Int,
+        operationID: UUID,
+        providerGeneration: UInt64
+    ) -> Bool {
+        self.ownsOperation(sessionID: sessionID, operationID: operationID) &&
+            self.providerGeneration == providerGeneration
+    }
+
+    func canPublishPreview(
+        sessionID: Int,
+        operationID: UUID,
+        providerGeneration: UInt64,
+        isRunning: Bool,
+        schedulingSessionID: Int?
+    ) -> Bool {
+        isRunning &&
+            schedulingSessionID == sessionID &&
+            self.canPublish(
+                sessionID: sessionID,
+                operationID: operationID,
+                providerGeneration: providerGeneration
+            )
+    }
+
+    mutating func finishOperation(sessionID: Int, operationID: UUID) -> Bool {
+        guard self.ownsOperation(sessionID: sessionID, operationID: operationID) else { return false }
+        self.activeOperationID = nil
+        return true
+    }
+
+    mutating func invalidateProvider() {
+        self.providerGeneration &+= 1
+    }
+
+    mutating func endSession(_ sessionID: Int) {
+        guard self.sessionID == sessionID, self.activeOperationID == nil else { return }
+        self.sessionID = nil
+    }
+}
+
+/// Blocks a new recording only while the previous recording still owns the shared PCM buffer.
+/// Cancelling a pending start releases its waiter without completing the active handoff.
+@MainActor
+final class RecordingBufferHandoffGate {
+    struct Token: Equatable {
+        private let id = UUID()
+    }
+
+    private var activeToken: Token?
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var isActive: Bool { self.activeToken != nil }
+    var pendingWaiterCount: Int { self.waiters.count }
+
+    func begin() -> Token? {
+        guard self.activeToken == nil else { return nil }
+        let token = Token()
+        self.activeToken = token
+        return token
+    }
+
+    func waitUntilAvailable() async {
+        guard self.activeToken != nil else { return }
+        await withCheckedContinuation { continuation in
+            self.waiters.append(continuation)
+        }
+    }
+
+    func releasePendingWaiters() {
+        let waiters = self.waiters
+        self.waiters.removeAll(keepingCapacity: false)
+        waiters.forEach { $0.resume() }
+    }
+
+    func complete(_ token: Token) {
+        guard self.activeToken == token else { return }
+        self.activeToken = nil
+        self.releasePendingWaiters()
+    }
+}
+
+/// Owns the cancellable idle delay separately from provider work. Normal recording
+/// stop cancels only the delay; an active provider operation is allowed to settle.
+@MainActor
+final class StreamingTaskLifecycle {
+    private var scheduler: (id: UUID, task: Task<Void, Never>)?
+    private var active: (sessionID: Int, operationID: UUID, task: Task<Void, Never>)?
+
+    var hasScheduledIdleWork: Bool { self.scheduler != nil }
+    var hasActiveWork: Bool { self.active != nil }
+
+    @discardableResult
+    func schedule(
+        sessionID: Int,
+        delayNanoseconds: UInt64,
+        operation: @escaping @MainActor (UUID) async -> Void,
+        completion: @escaping @MainActor (UUID) -> Void
+    ) -> Bool {
+        guard self.scheduler == nil, self.active == nil else { return false }
+        let schedulerID = UUID()
+        let task = Task { @MainActor [weak self] in
+            if delayNanoseconds > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: delayNanoseconds)
+                } catch {
+                    return
+                }
+            }
+            guard let self,
+                  Task.isCancelled == false,
+                  self.scheduler?.id == schedulerID
+            else { return }
+
+            self.scheduler = nil
+            let operationID = UUID()
+            let activeTask = Task { @MainActor [weak self] in
+                await operation(operationID)
+                guard let self,
+                      self.active?.sessionID == sessionID,
+                      self.active?.operationID == operationID
+                else { return }
+                self.active = nil
+                completion(operationID)
+            }
+            self.active = (sessionID, operationID, activeTask)
+        }
+        self.scheduler = (schedulerID, task)
+        return true
+    }
+
+    @discardableResult
+    func cancelScheduler() -> Bool {
+        guard let scheduler = self.scheduler else { return false }
+        self.scheduler = nil
+        scheduler.task.cancel()
+        return true
+    }
+
+    func activeTaskToDrain(sessionID: Int) -> Task<Void, Never>? {
+        guard let active = self.active, active.sessionID == sessionID else { return nil }
+        return active.task
+    }
+}
+
 struct ShortAudioSilenceAssessment: Equatable {
     let durationMilliseconds: Int
     let isEligible: Bool
@@ -336,6 +520,7 @@ final class ASRService: ObservableObject {
         _ = await preparationTask?.result
         _ = await downloadTask?.result
         await self.providerResetDrain?.task.value
+        self.streamingWorkState.invalidateProvider()
         await self.transcriptionExecutor.cancelAndAwaitPending()
 
         self.fluidAudioProvider = nil
@@ -609,6 +794,9 @@ final class ASRService: ObservableObject {
         let newModel = SettingsStore.shared.selectedSpeechModel
         DebugLogger.shared.info("ASRService: Switching to '\(newModel.displayName)', resetting provider state...", source: "ASRService")
 
+        // Any in-flight preview belongs to the provider being retired. Its operation
+        // still drains through the executor, but must not publish into this session.
+        self.streamingWorkState.invalidateProvider()
         self.isAsrReady = false
         self.modelsExistOnDisk = false
         self.isLoadingModel = false
@@ -1106,7 +1294,12 @@ final class ASRService: ObservableObject {
     private var lastCompletedAudioSnapshot: DictationAudioSnapshot?
 
     // Streaming transcription state (no VAD)
-    private var streamingTask: Task<Void, Never>?
+    private let streamingTaskLifecycle = StreamingTaskLifecycle()
+    private var streamingWorkState = StreamingTranscriptionWorkState()
+    private var streamingSchedulingSessionID: Int?
+    private let recordingBufferHandoffGate = RecordingBufferHandoffGate()
+    private var streamingHealthCheckCount: Int = 0
+    private var streamingHealthLastBufferCount: Int = 0
     private var lastProcessedSampleCount: Int = 0
     private var isProcessingChunk: Bool = false
     private var skipNextChunk: Bool = false
@@ -1743,6 +1936,22 @@ final class ASRService: ObservableObject {
         self.isStarting = true
         defer { self.finishAudioCaptureStart() }
 
+        // A prior stop may already have disabled capture while its final live-preview
+        // operation still owns the shared PCM buffer. Reserve this start immediately,
+        // but do not clear or enable the buffer until that bounded handoff completes.
+        while self.recordingBufferHandoffGate.isActive {
+            await self.recordingBufferHandoffGate.waitUntilAvailable()
+            guard startGeneration == self.audioCaptureStartGeneration,
+                  self.isTerminating == false
+            else {
+                DebugLogger.shared.debug(
+                    "Audio capture start cancelled while waiting for the previous buffer handoff",
+                    source: "ASRService"
+                )
+                return .failed
+            }
+        }
+
         // Reserve the start before relinquishing preview ownership so a
         // press-and-hold release can cancel the handoff. Keep the running input
         // alive; startConfiguredAudioCapture reuses it for zero-stop first PCM.
@@ -1776,6 +1985,9 @@ final class ASRService: ObservableObject {
         self.isProcessingChunk = false
         self.skipNextChunk = false
         self.benchmarkSessionID += 1
+        self.streamingWorkState.beginSession(self.benchmarkSessionID)
+        self.streamingHealthCheckCount = 0
+        self.streamingHealthLastBufferCount = 0
         self.silentPCMRecoveryWatchdog = AudioCaptureIdlePolicy.SilentPCMRecoveryWatchdog()
         let captureSessionID = self.benchmarkSessionID
         self.audioCaptureAttemptID &+= 1
@@ -2202,6 +2414,9 @@ final class ASRService: ObservableObject {
     func cancelPendingAudioCaptureStart(reason: String) async {
         guard self.isStarting, self.isRunning == false else { return }
         self.audioCaptureStartGeneration &+= 1
+        // A start waiting for the previous session's PCM handoff must wake to
+        // observe the generation change; the old stop keeps ownership of the gate.
+        self.recordingBufferHandoffGate.releasePendingWaiters()
         let cancelledSessionID = self.benchmarkSessionID
         self.benchmarkLog(
             "capture_start_cancel reason=\(reason) session=\(cancelledSessionID) " +
@@ -2350,6 +2565,18 @@ final class ASRService: ObservableObject {
             DebugLogger.shared.warning("⚠️ STOP() - not running, returning empty string", source: "ASRService")
             return ""
         }
+        let stoppingSessionID = self.benchmarkSessionID
+        guard let bufferHandoffToken = self.recordingBufferHandoffGate.begin() else {
+            DebugLogger.shared.warning("STOP() ignored - recording buffer handoff already active", source: "ASRService")
+            return ""
+        }
+        var completedBufferHandoff = false
+        defer {
+            if completedBufferHandoff == false {
+                self.recordingBufferHandoffGate.complete(bufferHandoffToken)
+            }
+        }
+        self.stopStreamingScheduler(sessionID: stoppingSessionID)
         let useDictionaryTrainingPath = forDictionaryTraining || self.isDictionaryTrainingCaptureActive
         defer {
             self.applyPendingParakeetVocabularyReloadIfNeeded()
@@ -2357,6 +2584,11 @@ final class ASRService: ObservableObject {
         }
 
         await self.cancelAudioRouteRecoveryAndWait()
+        guard self.isRunning, self.benchmarkSessionID == stoppingSessionID else {
+            self.recordingBufferHandoffGate.complete(bufferHandoffToken)
+            completedBufferHandoff = true
+            return ""
+        }
 
         // Capture media pause state before we reset it, for resuming at the end
         let shouldResumeMedia = self.didPauseMediaForThisSession
@@ -2380,8 +2612,11 @@ final class ASRService: ObservableObject {
         self.stopMonitoringDevice()
         DebugLogger.shared.debug("✅ Device monitoring stopped", source: "ASRService")
 
+        self.benchmarkLog("capture_stop_await_begin")
         await self.stopActiveAudioCapture(reason: "recording_stop")
+        self.benchmarkLog("capture_stop_await_return")
         self.audioCapturePipeline.finishRecording()
+        self.benchmarkLog("capture_pipeline_finished")
         self.audioCaptureStateSettledTick &+= 1
 
         // A prepared direct IOProc owns only fixed memory and registration; it
@@ -2402,7 +2637,13 @@ final class ASRService: ObservableObject {
         // Capture has fully ended — invoke the callback so callers can play a
         // stop cue or release capture-dependent UI without waiting on the
         // (potentially slow) final transcription pass.
-        await MainActor.run { onCaptureStopped?() }
+        self.benchmarkLog("capture_stopped_callback_request")
+        // stop() is MainActor-isolated; calling directly avoids needlessly
+        // yielding and re-enqueuing this callback behind unrelated UI work.
+        self.benchmarkLog("capture_stopped_callback_begin")
+        onCaptureStopped?()
+        self.benchmarkLog("capture_stopped_callback_end")
+        self.benchmarkLog("capture_stopped_callback_return")
 
         let directCaptureSnapshot = self.directAudioLifecycleController.snapshot
         self.benchmarkLog(
@@ -2410,13 +2651,14 @@ final class ASRService: ObservableObject {
                 "phase=\(directCaptureSnapshot.phase.rawValue) generation=\(directCaptureSnapshot.generation)"
         )
 
-        // CRITICAL FIX: Await completion of streaming task AND any pending transcriptions
-        // This prevents use-after-free crashes (EXC_BAD_ACCESS) when clearing buffer
-        DebugLogger.shared.debug("⏳ Awaiting stopStreamingTimerAndAwait()...", source: "ASRService")
+        // The idle scheduler was cancelled before teardown. Only real provider work
+        // can still own the PCM buffer here, so drain that operation without sending
+        // cancellation into incremental provider state.
+        DebugLogger.shared.debug("⏳ Awaiting active streaming work...", source: "ASRService")
         let streamingStopStartedAt = Date().timeIntervalSince1970
-        await self.stopStreamingTimerAndAwait()
+        await self.drainActiveStreamingWork(sessionID: stoppingSessionID)
         self.benchmarkLog("stop_streaming_wait elapsedMs=\(self.elapsedMilliseconds(since: streamingStopStartedAt))")
-        DebugLogger.shared.debug("✅ stopStreamingTimerAndAwait() completed", source: "ASRService")
+        DebugLogger.shared.debug("✅ Active streaming work completed", source: "ASRService")
 
         self.isProcessingChunk = false
         self.skipNextChunk = false
@@ -2427,6 +2669,12 @@ final class ASRService: ObservableObject {
         var pcm = self.audioBuffer.getAll()
         self.audioBuffer.clear()
         let capturedPCM = pcm
+        let hasRecognizedStreamingPreview = !self.partialTranscription
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        self.streamingWorkState.endSession(stoppingSessionID)
+        self.recordingBufferHandoffGate.complete(bufferHandoffToken)
+        completedBufferHandoff = true
         self.benchmarkLog("stop_audio_drained samples=\(pcm.count) audioMs=\(Int((Double(pcm.count) / 16_000.0 * 1000).rounded()))")
 
         // Drop recordings with no audio at all — nothing to transcribe.
@@ -2447,9 +2695,6 @@ final class ASRService: ObservableObject {
             return ""
         }
 
-        let hasRecognizedStreamingPreview = !self.partialTranscription
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty
         if Self.shouldAssessShortAudioSilence(
             isEnabled: SettingsStore.shared.skipSilentRecordingsEnabled,
             useDictionaryTrainingPath: useDictionaryTrainingPath,
@@ -2537,9 +2782,16 @@ final class ASRService: ObservableObject {
                 self.lastDictionaryTrainingResult = result
                 finalSource = "dictionaryTraining"
             } else {
+                self.benchmarkLog("final_executor_request")
                 result = try await self.transcriptionExecutor.run { [provider] in
-                    try await provider.transcribeFinal(pcm)
+                    let executionStartedAt = ProcessInfo.processInfo.systemUptime
+                    DebugLogger.shared.info("ASR_BENCH t=\(executionStartedAt) final_executor_begin", source: "ASRBenchmark")
+                    defer {
+                        DebugLogger.shared.info("ASR_BENCH t=\(ProcessInfo.processInfo.systemUptime) final_executor_end", source: "ASRBenchmark")
+                    }
+                    return try await provider.transcribeFinal(pcm)
                 }
+                self.benchmarkLog("final_executor_return")
                 finalSource = "full"
             }
             let finalElapsedMs = self.elapsedMilliseconds(since: finalStartedAt)
@@ -2781,12 +3033,26 @@ final class ASRService: ObservableObject {
             await self.cancelPendingAudioCaptureStart(reason: "stop_without_transcription")
         }
         guard self.isRunning else { return }
+        let stoppingSessionID = self.benchmarkSessionID
+        guard let bufferHandoffToken = self.recordingBufferHandoffGate.begin() else { return }
+        var completedBufferHandoff = false
+        defer {
+            if completedBufferHandoff == false {
+                self.recordingBufferHandoffGate.complete(bufferHandoffToken)
+            }
+        }
+        self.stopStreamingScheduler(sessionID: stoppingSessionID)
         defer {
             self.applyPendingParakeetVocabularyReloadIfNeeded()
             self.isDictionaryTrainingCaptureActive = false
         }
 
         await self.cancelAudioRouteRecoveryAndWait()
+        guard self.isRunning, self.benchmarkSessionID == stoppingSessionID else {
+            self.recordingBufferHandoffGate.complete(bufferHandoffToken)
+            completedBufferHandoff = true
+            return
+        }
 
         // Capture media pause state before we reset it, for resuming at the end
         let shouldResumeMedia = self.didPauseMediaForThisSession
@@ -2811,12 +3077,13 @@ final class ASRService: ObservableObject {
         await self.retireAudioEngineAndWait(reason: "stop_without_transcription")
         self.audioCaptureStateSettledTick &+= 1
 
-        // CRITICAL FIX: Await completion of streaming task AND any pending transcriptions
-        // This prevents use-after-free crashes (EXC_BAD_ACCESS) when clearing buffer
-        await self.stopStreamingTimerAndAwait()
+        await self.drainActiveStreamingWork(sessionID: stoppingSessionID)
 
         // NOW it's safe to clear the buffer
         self.audioBuffer.clear()
+        self.streamingWorkState.endSession(stoppingSessionID)
+        self.recordingBufferHandoffGate.complete(bufferHandoffToken)
+        completedBufferHandoff = true
         self.partialTranscription.removeAll()
         self.previousFullTranscription.removeAll()
         self.lastBoostHitTerm = nil
@@ -4630,15 +4897,18 @@ final class ASRService: ObservableObject {
 
     func clearModelCache() async throws {
         DebugLogger.shared.debug("Clearing model cache via transcription provider", source: "ASRService")
+        self.streamingWorkState.invalidateProvider()
+        self.isAsrReady = false
         await self.transcriptionExecutor.cancelAndAwaitPending()
         try await self.transcriptionProvider.clearCache()
-        self.isAsrReady = false
         self.modelsExistOnDisk = false
     }
 
     func clearModelCache(for model: SettingsStore.SpeechModel) async throws {
         DebugLogger.shared.debug("Clearing model cache for \(model.displayName)", source: "ASRService")
         if SettingsStore.shared.selectedSpeechModel == model {
+            self.streamingWorkState.invalidateProvider()
+            self.isAsrReady = false
             await self.transcriptionExecutor.cancelAndAwaitPending()
         }
         let provider = self.getProvider(for: model)
@@ -4656,61 +4926,89 @@ final class ASRService: ObservableObject {
     // MARK: - Timer-based Streaming Transcription (No VAD)
 
     private func startStreamingTranscription() {
-        self.streamingTask?.cancel()
+        self.streamingSchedulingSessionID = nil
+        _ = self.streamingTaskLifecycle.cancelScheduler()
         guard self.isAsrReady else { return }
+        self.streamingSchedulingSessionID = self.benchmarkSessionID
 
         DebugLogger.shared.debug(
             "Starting streaming transcription task (interval: \(self.streamingChunkDurationSeconds)s, minSamples: \(self.minimumStreamingPreviewSamples))",
             source: "ASRService"
         )
-
-        self.streamingTask = Task { [weak self] in
-            await self?.runStreamingLoop()
-        }
+        self.scheduleNextStreamingChunk(sessionID: self.benchmarkSessionID, delayNanoseconds: 0)
     }
 
-    @MainActor
-    private func runStreamingLoop() async {
-        DebugLogger.shared.debug("🔄 runStreamingLoop() - ENTERED", source: "ASRService")
-        var loopCount = 0
-        var lastBufferCount = 0
-
-        while !Task.isCancelled {
-            DebugLogger.shared.debug("🔄 runStreamingLoop() - calling processStreamingChunk()", source: "ASRService")
-            await self.processStreamingChunk()
-            DebugLogger.shared.debug("🔄 runStreamingLoop() - processStreamingChunk() returned", source: "ASRService")
-
-            if Task.isCancelled || self.isRunning == false {
-                break
+    private func scheduleNextStreamingChunk(sessionID: Int, delayNanoseconds: UInt64) {
+        guard self.isRunning,
+              self.benchmarkSessionID == sessionID,
+              self.streamingSchedulingSessionID == sessionID
+        else { return }
+        self.streamingTaskLifecycle.schedule(
+            sessionID: sessionID,
+            delayNanoseconds: delayNanoseconds
+        ) { [weak self] operationID in
+            await self?.processStreamingChunk(sessionID: sessionID, operationID: operationID)
+            self?.benchmarkLog(
+                "streaming_active_exit session=\(sessionID) operation=\(operationID.uuidString)"
+            )
+        } completion: { [weak self] operationID in
+            let isLateCompletion = self?.isRunning == false || self?.streamingSchedulingSessionID != sessionID
+            if isLateCompletion {
+                self?.benchmarkLog(
+                    "streaming_active_cleanup_begin session=\(sessionID) operation=\(operationID.uuidString)"
+                )
             }
-
-            // Health check: detect if audio is not being captured
-            loopCount += 1
-            if loopCount >= 3 { // After 3 loops (~6 seconds with 2s interval)
-                let currentBufferCount = self.audioBuffer.count
-                if currentBufferCount == lastBufferCount, currentBufferCount < 16_000 {
-                    DebugLogger.shared.warning(
-                        "Audio buffer not growing after \(loopCount * 2) seconds (count: \(currentBufferCount)). " +
-                            "Audio capture may have failed. Check if engine is running and tap is installed.",
-                        source: "ASRService"
-                    )
-                }
-                lastBufferCount = currentBufferCount
-                loopCount = 0
-            }
-
-            do {
-                try await Task.sleep(nanoseconds: UInt64(self.streamingChunkDurationSeconds * 1_000_000_000))
-            } catch {
-                DebugLogger.shared.debug("Streaming transcription task cancelled", source: "ASRService")
-                break
+            self?.streamingChunkDidFinish(sessionID: sessionID, operationID: operationID)
+            if isLateCompletion {
+                self?.benchmarkLog(
+                    "streaming_active_cleanup_end session=\(sessionID) operation=\(operationID.uuidString)"
+                )
             }
         }
     }
 
-    @MainActor
-    private func processStreamingChunk() async {
-        guard self.isRunning else { return }
+    private func streamingChunkDidFinish(sessionID: Int, operationID: UUID) {
+        guard self.streamingWorkState.finishOperation(
+            sessionID: sessionID,
+            operationID: operationID
+        ) else { return }
+        self.isProcessingChunk = false
+        guard self.isRunning,
+              self.benchmarkSessionID == sessionID,
+              self.streamingSchedulingSessionID == sessionID
+        else { return }
+
+        self.streamingHealthCheckCount += 1
+        if self.streamingHealthCheckCount >= 3 {
+            let currentBufferCount = self.audioBuffer.count
+            if currentBufferCount == self.streamingHealthLastBufferCount,
+               currentBufferCount < 16_000
+            {
+                DebugLogger.shared.warning(
+                    "Audio buffer not growing after three streaming intervals (count: \(currentBufferCount)). " +
+                        "Audio capture may have failed. Check if engine is running and tap is installed.",
+                    source: "ASRService"
+                )
+            }
+            self.streamingHealthLastBufferCount = currentBufferCount
+            self.streamingHealthCheckCount = 0
+        }
+
+        self.scheduleNextStreamingChunk(
+            sessionID: sessionID,
+            delayNanoseconds: UInt64(self.streamingChunkDurationSeconds * 1_000_000_000)
+        )
+    }
+
+    private func processStreamingChunk(sessionID: Int, operationID: UUID) async {
+        guard self.isRunning,
+              self.benchmarkSessionID == sessionID,
+              self.streamingSchedulingSessionID == sessionID,
+              let providerGeneration = self.streamingWorkState.beginOperation(
+                  sessionID: sessionID,
+                  operationID: operationID
+              )
+        else { return }
         self.benchmarkStreamingChunkIndex += 1
         let chunkIndex = self.benchmarkStreamingChunkIndex
         let chunkAgeMs = self.elapsedMilliseconds(since: self.benchmarkRecordingStartedAt)
@@ -4779,7 +5077,6 @@ final class ASRService: ObservableObject {
         }
 
         self.isProcessingChunk = true
-        defer { isProcessingChunk = false }
 
         let startTime = Date()
         let startedAt = startTime.timeIntervalSince1970
@@ -4799,34 +5096,82 @@ final class ASRService: ObservableObject {
             if incrementalDeltaStart != nil, let incrementalProvider {
                 do {
                     result = try await self.transcriptionExecutor.run {
-                        try await incrementalProvider.transcribeStreamingDelta(
+                        let result = try await incrementalProvider.transcribeStreamingDelta(
                             chunk,
                             totalSampleCount: currentSampleCount
                         )
+                        logStreamingProviderOperationReturn(
+                            sessionID: sessionID,
+                            operationID: operationID,
+                            route: "incremental_delta"
+                        )
+                        return result
                     }
                 } catch {
                     if Task.isCancelled || error is CancellationError {
                         throw CancellationError()
                     }
+                    guard self.streamingWorkState.canPublishPreview(
+                        sessionID: sessionID,
+                        operationID: operationID,
+                        providerGeneration: providerGeneration,
+                        isRunning: self.isRunning,
+                        schedulingSessionID: self.streamingSchedulingSessionID
+                    ) else { return }
                     DebugLogger.shared.warning(
                         "Incremental delta preview failed; retrying with the full prefix",
                         source: "ASRService"
                     )
                     let fullPrefix = self.audioBuffer.getPrefix(currentSampleCount)
                     result = try await self.transcriptionExecutor.run { [provider = self.transcriptionProvider] in
-                        try await provider.transcribeStreaming(fullPrefix)
+                        let result = try await provider.transcribeStreaming(fullPrefix)
+                        logStreamingProviderOperationReturn(
+                            sessionID: sessionID,
+                            operationID: operationID,
+                            route: "incremental_fallback_full"
+                        )
+                        return result
                     }
                 }
             } else {
                 result = try await self.transcriptionExecutor.run { [provider = self.transcriptionProvider] in
-                    try await provider.transcribeStreaming(chunk)
+                    let result = try await provider.transcribeStreaming(chunk)
+                    logStreamingProviderOperationReturn(
+                        sessionID: sessionID,
+                        operationID: operationID,
+                        route: "full_prefix"
+                    )
+                    return result
                 }
             }
             #else
             result = try await self.transcriptionExecutor.run { [provider = self.transcriptionProvider] in
-                try await provider.transcribeStreaming(chunk)
+                let result = try await provider.transcribeStreaming(chunk)
+                logStreamingProviderOperationReturn(
+                    sessionID: sessionID,
+                    operationID: operationID,
+                    route: "full_prefix"
+                )
+                return result
             }
             #endif
+
+            let canPublishPreview = self.streamingWorkState.canPublishPreview(
+                sessionID: sessionID,
+                operationID: operationID,
+                providerGeneration: providerGeneration,
+                isRunning: self.isRunning,
+                schedulingSessionID: self.streamingSchedulingSessionID
+            )
+            if canPublishPreview == false {
+                let scheduledSession = self.streamingSchedulingSessionID.map(String.init) ?? "none"
+                self.benchmarkLog(
+                    "streaming_executor_return publish=false index=\(chunkIndex) session=\(sessionID) " +
+                        "operation=\(operationID.uuidString) running=\(self.isRunning) " +
+                        "scheduledSession=\(scheduledSession)"
+                )
+                return
+            }
 
             let duration = Date().timeIntervalSince(startTime)
             DebugLogger.shared.debug(
@@ -4844,11 +5189,9 @@ final class ASRService: ObservableObject {
             // Mark first transcription as complete to clear loading state
             if !self.hasCompletedFirstTranscription {
                 self.hasCompletedFirstTranscription = true
-                DispatchQueue.main.async {
-                    self.isLoadingModel = false
-                    self.modelPreparationPhase = nil
-                    DebugLogger.shared.info("✅ Model warmed up - first streaming transcription completed", source: "ASRService")
-                }
+                self.isLoadingModel = false
+                self.modelPreparationPhase = nil
+                DebugLogger.shared.info("✅ Model warmed up - first streaming transcription completed", source: "ASRService")
             }
 
             if !newText.isEmpty {
@@ -4875,10 +5218,20 @@ final class ASRService: ObservableObject {
                 )
                 self.skipNextChunk = true
             }
-        } catch {
+        } catch where self.streamingWorkState.canPublishPreview(
+            sessionID: sessionID,
+            operationID: operationID,
+            providerGeneration: providerGeneration,
+            isRunning: self.isRunning,
+            schedulingSessionID: self.streamingSchedulingSessionID
+        ) {
             DebugLogger.shared.error("❌ Streaming failed: \(error)", source: "ASRService")
             self.benchmarkLog("chunk_fail index=\(chunkIndex) elapsedMs=\(self.elapsedMilliseconds(since: startedAt)) samples=\(currentSampleCount) inputSamples=\(chunk.count) error=\(error.localizedDescription)")
             self.skipNextChunk = true
+        } catch {
+            self.benchmarkLog(
+                "chunk_stale_failure index=\(chunkIndex) session=\(sessionID) operation=\(operationID.uuidString)"
+            )
         }
     }
 
@@ -4926,7 +5279,8 @@ final class ASRService: ObservableObject {
         _ plan: DictationLiteralOutputPlan,
         preferredTargetPID: pid_t?,
         textReadyAt: TimeInterval? = nil,
-        tracksDictionaryCorrections: Bool = false
+        tracksDictionaryCorrections: Bool = false,
+        completion: (@MainActor (TypingService.DeliveryOutcome) -> Void)? = nil
     ) {
         let requestedAt = ProcessInfo.processInfo.systemUptime
         let textReadyAge = textReadyAt.map { Int(((requestedAt - $0) * 1000).rounded()) }
@@ -4940,7 +5294,8 @@ final class ASRService: ObservableObject {
             plan,
             preferredTargetPID: preferredTargetPID,
             textReadyAt: textReadyAt,
-            tracksDictionaryCorrections: tracksDictionaryCorrections
+            tracksDictionaryCorrections: tracksDictionaryCorrections,
+            completion: completion
         )
         let dispatchedAt = ProcessInfo.processInfo.systemUptime
         let textReadyToDispatchMs = textReadyAt.map {
@@ -5222,29 +5577,47 @@ private extension SettingsStore.SpeechModel {
 }
 
 private extension ASRService {
-    /// Stops the streaming timer and waits for the task to complete.
-    /// This prevents race conditions where the buffer is cleared while
-    /// a transcription task is still running.
-    func stopStreamingTimerAndAwait() async {
-        guard let task = self.streamingTask else {
-            self.benchmarkLog("streaming_timer_stop no_task=true")
-            return
-        }
+    /// Cancels only the idle delay. Active provider work is intentionally not
+    /// cancelled because incremental providers use cancellation to discard state
+    /// needed by the final pass.
+    func stopStreamingScheduler(sessionID: Int) {
         let startedAt = Date().timeIntervalSince1970
-        self.benchmarkLog("streaming_timer_stop begin")
-        task.cancel()
-        // Wait for the task to actually finish - this is critical!
-        // The task may be in the middle of processStreamingChunk()
-        _ = await task.result
-        self.streamingTask = nil
-        self.benchmarkLog("streaming_timer_stop end elapsedMs=\(self.elapsedMilliseconds(since: startedAt)) completedChunks=\(self.benchmarkCompletedStreamingChunks)")
+        if self.streamingSchedulingSessionID == sessionID {
+            self.streamingSchedulingSessionID = nil
+        }
+        let cancelled = self.streamingTaskLifecycle.cancelScheduler()
+        self.benchmarkLog(
+            "streaming_scheduler_cancel session=\(sessionID) hadIdleTask=\(cancelled) " +
+                "elapsedMs=\(self.elapsedMilliseconds(since: startedAt))"
+        )
     }
 
-    /// Legacy sync version for cases where we can't await (e.g., stopWithoutTranscription)
-    /// WARNING: This can cause crashes if buffer is cleared immediately after!
-    func stopStreamingTimer() {
-        self.streamingTask?.cancel()
-        self.streamingTask = nil
+    /// Drains only real in-flight provider work before the shared PCM buffer is
+    /// handed off. An idle scheduler never participates in this await.
+    func drainActiveStreamingWork(sessionID: Int) async {
+        let startedAt = Date().timeIntervalSince1970
+        guard let activeTask = self.streamingTaskLifecycle.activeTaskToDrain(sessionID: sessionID) else {
+            self.benchmarkLog(
+                "streaming_timer_stop begin phase=idle session=\(sessionID)"
+            )
+            self.benchmarkLog(
+                "streaming_timer_stop end phase=idle session=\(sessionID) elapsedMs=0 " +
+                    "completedChunks=\(self.benchmarkCompletedStreamingChunks)"
+            )
+            return
+        }
+        self.benchmarkLog(
+            "streaming_timer_stop begin phase=active session=\(sessionID)"
+        )
+        _ = await activeTask.result
+        self.benchmarkLog(
+            "streaming_active_drain_resume session=\(sessionID)"
+        )
+        self.benchmarkLog(
+            "streaming_timer_stop end phase=active session=\(sessionID) " +
+                "elapsedMs=\(self.elapsedMilliseconds(since: startedAt)) " +
+                "completedChunks=\(self.benchmarkCompletedStreamingChunks)"
+        )
     }
 }
 

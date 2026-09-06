@@ -129,7 +129,12 @@ final class HotkeyShortcutTests: XCTestCase {
         await Task.yield()
         controller.show(audioPublisher: audioPublisher, mode: .dictation)
         controller.hide()
+        XCTAssertTrue(
+            NotchContentState.shared.isBottomOverlayDismissing,
+            "A nonblocking hide must start the visual transition before returning"
+        )
         controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        XCTAssertFalse(NotchContentState.shared.isBottomOverlayDismissing)
         let outcome = await controller.hideAndWait()
 
         XCTAssertEqual(outcome, .hidden)
@@ -153,6 +158,25 @@ final class HotkeyShortcutTests: XCTestCase {
         let hideOutcome = await hideTask.value
         XCTAssertEqual(hideOutcome, .superseded)
         XCTAssertTrue(NotchContentState.shared.isBottomOverlayPresented)
+        _ = await controller.hideAndWait()
+    }
+
+    @MainActor
+    func testBottomOverlayImmediateHideCompletesBeforeReturningAndAllowsRestart() async {
+        let audioPublisher = Just(CGFloat.zero).eraseToAnyPublisher()
+        let controller = BottomOverlayWindowController.shared
+
+        controller.prepare()
+        await Task.yield()
+        controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        controller.hideImmediately()
+
+        XCTAssertTrue(controller.isVisuallyHiddenForTests)
+
+        controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        XCTAssertTrue(NotchContentState.shared.isBottomOverlayPresented)
+        XCTAssertFalse(controller.isVisuallyHiddenForTests)
+        XCTAssertFalse(NotchContentState.shared.isBottomOverlayDismissing)
         _ = await controller.hideAndWait()
     }
 
@@ -228,7 +252,7 @@ final class HotkeyShortcutTests: XCTestCase {
         defer { settingsStore.skipSilentRecordingsEnabled = originalValue }
 
         settingsStore.skipSilentRecordingsEnabled = true
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         XCTAssertEqual(document.settings.skipSilentRecordingsEnabled, true)
 
         let encoded = try BackupService.shared.encode(document)
@@ -258,7 +282,7 @@ final class HotkeyShortcutTests: XCTestCase {
         XCTAssertTrue(SettingsStore.shared.experimentalParakeetUnifiedFinalEnabled)
 
         SettingsStore.shared.experimentalParakeetUnifiedFinalEnabled = false
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         XCTAssertEqual(document.settings.experimentalParakeetUnifiedFinalEnabled, false)
 
         let encoded = try BackupService.shared.encode(document)
@@ -288,7 +312,7 @@ final class HotkeyShortcutTests: XCTestCase {
         XCTAssertFalse(SettingsStore.shared.showHistoryPerformanceMetrics)
 
         SettingsStore.shared.showHistoryPerformanceMetrics = true
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         XCTAssertEqual(document.settings.showHistoryPerformanceMetrics, true)
 
         let encoded = try BackupService.shared.encode(document)
@@ -340,7 +364,7 @@ final class HotkeyShortcutTests: XCTestCase {
 
     @MainActor
     func testLegacySystemModeBackupQueuesMicrophonePriorityMigration() async throws {
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
 
         try self.withRestoredDefaults(keys: [
             self.microphoneSelectionModeKey,
@@ -366,8 +390,8 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
-    func testPriorityBackupKeepsCompletedMicrophoneMigration() async {
-        let document = await BackupService.shared.makeBackupDocument()
+    func testPriorityBackupKeepsCompletedMicrophoneMigration() async throws {
+        let document = try await BackupService.shared.makeBackupDocument()
 
         self.withRestoredDefaults(keys: [self.microphoneSelectionMigrationVersionKey]) {
             SettingsStore.shared.microphoneSelectionMigrationVersion = 4
@@ -379,7 +403,7 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
-    func testPriorityBackupRoundTripsRemovedConnectedMicrophones() async {
+    func testPriorityBackupRoundTripsRemovedConnectedMicrophones() async throws {
         let originalPriority = SettingsStore.shared.microphonePriority
         let originalSuppressedUIDs = SettingsStore.shared.suppressedMicrophoneUIDs
         defer {
@@ -391,7 +415,7 @@ final class HotkeyShortcutTests: XCTestCase {
             .init(uid: "kept-mic", name: "Kept Microphone"),
         ]
         SettingsStore.shared.suppressedMicrophoneUIDs = ["removed-connected-mic"]
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
 
         XCTAssertEqual(document.settings.suppressedMicrophoneUIDs, ["removed-connected-mic"])
         SettingsStore.shared.suppressedMicrophoneUIDs = []
@@ -1953,10 +1977,10 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
-    func testSelectingOrRestoringMicrophoneClearsRemovalSuppression() async {
+    func testSelectingOrRestoringMicrophoneClearsRemovalSuppression() async throws {
         let originalSuppressedUIDs = SettingsStore.shared.suppressedMicrophoneUIDs
         SettingsStore.shared.suppressedMicrophoneUIDs = []
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         defer { SettingsStore.shared.suppressedMicrophoneUIDs = originalSuppressedUIDs }
 
         self.withRestoredDefaults(keys: [
