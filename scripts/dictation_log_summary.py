@@ -13,7 +13,9 @@ import statistics
 from pathlib import Path
 
 
-MARKER = re.compile(r"\b(APP_BENCH|ASR_BENCH|OVERLAY_BENCH|TYPING_BENCH|HISTORY_BENCH|PIPELINE_SUMMARY)\b(.*)")
+MARKER = re.compile(
+    r"\b(APP_BENCH|ASR_BENCH|FI_BRIDGE_BENCH|OVERLAY_BENCH|TYPING_BENCH|HISTORY_BENCH|PIPELINE_SUMMARY)\b(.*)"
+)
 FIELD = re.compile(r"(?:^|\s)(\w+)=([^\s]+)")
 WALL = re.compile(r"^\[([\d:.]+)\]")
 
@@ -115,6 +117,13 @@ def summarize(run):
             "APP_BENCH", {"processing_ui_requested"}, "status", "Refining", after
         )),
         "ai_call": time(find("APP_BENCH", {"ai_process_call"}, after)),
+        "ai_route_resolved": time(find("APP_BENCH", {"ai_route_resolved"}, after)),
+        "ai_private_call": time(find("APP_BENCH", {"ai_private_call"}, after)),
+        "ai_bridge_enter": time(find("FI_BRIDGE_BENCH", {"enhance_enter"}, after)),
+        "ai_model_call": time(find("FI_BRIDGE_BENCH", {"run_call"}, after)),
+        "ai_model_return": time(find("FI_BRIDGE_BENCH", {"run_return"}, after)),
+        "ai_bridge_return": time(find("FI_BRIDGE_BENCH", {"enhance_return"}, after)),
+        "ai_private_return": time(find("APP_BENCH", {"ai_private_return"}, after)),
         "ai_return": time(find("APP_BENCH", {"ai_process_return"}, after)),
         "text_ready": time(find("APP_BENCH", {"text_ready"}, after)),
         "paste_dispatch": time(find("TYPING_BENCH", {"asr_type_dispatched"}, after)),
@@ -163,6 +172,12 @@ def summarize(run):
         "asr_provider_ms": provider_final_ms,
         "asr_to_ai_call_ms": delta(phases["ai_call"], phases["asr_return"]),
         "refining_to_ai_call_ms": delta(phases["ai_call"], phases["refining_requested"]),
+        "ai_route_ms": delta(phases["ai_route_resolved"], phases["ai_call"]),
+        "ai_call_to_bridge_ms": delta(phases["ai_bridge_enter"], phases["ai_private_call"]),
+        "ai_bridge_setup_ms": delta(phases["ai_model_call"], phases["ai_bridge_enter"]),
+        "ai_model_envelope_ms": delta(phases["ai_model_return"], phases["ai_model_call"]),
+        "ai_bridge_tail_ms": delta(phases["ai_bridge_return"], phases["ai_model_return"]),
+        "ai_return_hop_ms": delta(phases["ai_private_return"], phases["ai_bridge_return"]),
         "ai_processing_ms": delta(phases["ai_return"], phases["ai_call"]),
         "ai_to_ready_ms": delta(phases["text_ready"], phases["ai_return"]),
         "internal_stop_to_ready_ms": delta(phases["text_ready"], stop),
@@ -216,6 +231,16 @@ def render(rows, details=False):
                   m["ai_to_ready_ms"], m["internal_stop_to_ready_ms"]]
         lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | " + " | ".join(map(fmt, values)) + " |")
     lines += ["", "ASR provider and AI process are measured model-call envelopes; all other columns are glue/handoff time."]
+    if any(row["metrics"]["ai_model_envelope_ms"] is not None for row in rows):
+        lines += ["", "## AI handoff detail", "",
+                  "| Time / ID | Route | Call→bridge | Bridge setup | FI run | Bridge tail | Return hop | AI total |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|"]
+        for row in rows:
+            m = row["metrics"]
+            values = [m["ai_route_ms"], m["ai_call_to_bridge_ms"], m["ai_bridge_setup_ms"],
+                      m["ai_model_envelope_ms"], m["ai_bridge_tail_ms"], m["ai_return_hop_ms"],
+                      m["ai_processing_ms"]]
+            lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | " + " | ".join(map(fmt, values)) + " |")
     if details:
         for row in rows:
             context = row["context"]

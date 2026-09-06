@@ -2223,6 +2223,7 @@ struct ContentView: View {
         dictationSlot: SettingsStore.DictationShortcutSlot? = nil,
         streamHandler: PrivateAIStreamHandler? = nil
     ) async throws -> AITextProcessingResult {
+        let routeStartedAt = ProcessInfo.processInfo.systemUptime
         let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
         let route: DictationProviderRoute
         if let overrideProviderID, let overrideModel {
@@ -2238,6 +2239,9 @@ struct ContentView: View {
                 appBundleID: appInfo.bundleId
             )
         }
+        self.appBench(
+            "ai_route_resolved elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - routeStartedAt) * 1000).rounded()))"
+        )
         let currentSelectedProviderID = route.providerID
         let derivedCurrentProvider = route.providerKey
         let derivedBaseURL = route.baseURL
@@ -2265,6 +2269,7 @@ struct ContentView: View {
                 self.logDictationPromptTrace("Selected context text", value: "<none (dictation mode)>")
             }
 
+            self.appBench("ai_private_call")
             let response = try await PrivateAIIntegrationService.shared.enhanceDictation(
                 inputText,
                 runtime: PrivateAIIntegrationService.RuntimeConfiguration(
@@ -2286,6 +2291,7 @@ struct ContentView: View {
                 ),
                 streamHandler: streamHandler
             )
+            self.appBench("ai_private_return")
 
             if self.shouldTracePromptProcessing {
                 self.logDictationPromptTrace("Model answer (A)", value: response.outputText)
