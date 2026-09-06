@@ -1,6 +1,6 @@
 import Foundation
 
-class DebugLogger {
+final nonisolated class DebugLogger: @unchecked Sendable {
     static let shared = DebugLogger()
 
     private let queue = DispatchQueue(label: "debug.logger", qos: .utility)
