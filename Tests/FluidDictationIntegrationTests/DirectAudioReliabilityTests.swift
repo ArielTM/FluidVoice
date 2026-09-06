@@ -6,6 +6,39 @@ import XCTest
 
 final class DirectAudioReliabilityTests: XCTestCase {
     @MainActor
+    func testAIStreamPreviewCoalescesBurstIntoOneMainActorUpdate() async {
+        var publishedText: [String] = []
+        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 0) { text in
+            publishedText.append(text)
+        }
+
+        preview.append("Fluid")
+        preview.append("Voice")
+        preview.append(" benchmark")
+        preview.flush()
+        await Task.yield()
+
+        XCTAssertEqual(publishedText, ["FluidVoice benchmark"])
+    }
+
+    @MainActor
+    func testAIStreamPreviewFlushesShortGenerationWithoutQueuedUIWork() async {
+        var publishedText: [String] = []
+        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 60) { text in
+            publishedText.append(text)
+        }
+
+        preview.append("Exact output")
+        XCTAssertTrue(publishedText.isEmpty)
+
+        preview.flush()
+        preview.flush()
+        await Task.yield()
+
+        XCTAssertEqual(publishedText, ["Exact output"])
+    }
+
+    @MainActor
     func testCaptureSettledEventDoesNotInvalidateWholeASRService() {
         let service = ASRService()
         var settledEventCount = 0

@@ -48,29 +48,69 @@ enum AIProcessingError: LocalizedError {
     }
 }
 
-@MainActor
-private final class DictationAIStreamPreviewBuffer {
-    private var chunks: [String] = []
-    private var lastUIUpdate = CFAbsoluteTimeGetCurrent()
-    private let minimumUpdateInterval: CFTimeInterval = 0.033
+final nonisolated class DictationAIStreamPreviewBuffer: @unchecked Sendable {
+    typealias Publisher = @MainActor @Sendable (String) -> Void
+
+    private let lock = NSLock()
+    private let minimumUpdateInterval: TimeInterval
+    private let publisher: Publisher
+    private var bufferedText = ""
+    private var lastPublishedText = ""
+    private var lastUIUpdate = ProcessInfo.processInfo.systemUptime
+    private var isUIUpdateScheduled = false
+
+    init(
+        minimumUpdateInterval: TimeInterval = 0.033,
+        publisher: @escaping Publisher = { text in
+            NotchOverlayManager.shared.updateTranscriptionText(text)
+        }
+    ) {
+        self.minimumUpdateInterval = minimumUpdateInterval
+        self.publisher = publisher
+    }
 
     func append(_ chunk: String) {
         guard !chunk.isEmpty else { return }
-        self.chunks.append(chunk)
+        let shouldSchedule = self.lock.withLock {
+            self.bufferedText += chunk
+            guard !self.isUIUpdateScheduled,
+                  ProcessInfo.processInfo.systemUptime - self.lastUIUpdate >= self.minimumUpdateInterval
+            else {
+                return false
+            }
+            self.isUIUpdateScheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
 
-        let now = CFAbsoluteTimeGetCurrent()
-        guard now - self.lastUIUpdate >= self.minimumUpdateInterval else { return }
-        self.lastUIUpdate = now
-        self.publish()
+        Task { @MainActor [weak self] in
+            self?.publishScheduledUpdate()
+        }
     }
 
+    @MainActor
     func flush() {
-        self.publish()
+        guard let text = self.takeTextForPublishing(requiresScheduledUpdate: false) else { return }
+        self.publisher(text)
     }
 
-    private func publish() {
-        let processedText = self.chunks.joined()
-        NotchOverlayManager.shared.updateTranscriptionText(processedText)
+    @MainActor
+    private func publishScheduledUpdate() {
+        guard let text = self.takeTextForPublishing(requiresScheduledUpdate: true) else { return }
+        self.publisher(text)
+    }
+
+    private func takeTextForPublishing(requiresScheduledUpdate: Bool) -> String? {
+        self.lock.withLock {
+            if requiresScheduledUpdate, !self.isUIUpdateScheduled {
+                return nil
+            }
+            self.isUIUpdateScheduled = false
+            self.lastUIUpdate = ProcessInfo.processInfo.systemUptime
+            guard self.bufferedText != self.lastPublishedText else { return nil }
+            self.lastPublishedText = self.bufferedText
+            return self.bufferedText
+        }
     }
 }
 
@@ -2638,9 +2678,7 @@ struct ContentView: View {
 
             let streamPreview = DictationAIStreamPreviewBuffer()
             let streamHandler: PrivateAIStreamHandler = { chunk in
-                Task { @MainActor in
-                    streamPreview.append(chunk)
-                }
+                streamPreview.append(chunk)
             }
 
             do {
@@ -2654,7 +2692,7 @@ struct ContentView: View {
                 finalText = result.text
                 self.appBench("ai_process_return id=\(pipelineID)")
                 aiTokensPerSecond = result.tokensPerSecond
-                await streamPreview.flush()
+                streamPreview.flush()
                 self.appBench("ai_preview_flushed id=\(pipelineID)")
             } catch {
                 // Fall back to the raw transcription so the user still gets
