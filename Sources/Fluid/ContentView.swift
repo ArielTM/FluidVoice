@@ -2648,9 +2648,6 @@ struct ContentView: View {
             NotchOverlayManager.shared.updateTranscriptionText("Refining")
             self.appBench("processing_ui_requested status=Refining")
 
-            // Ensure the status label becomes visible immediately.
-            await Task.yield()
-
             let streamPreview = DictationAIStreamPreviewBuffer()
             let streamHandler: PrivateAIStreamHandler = { chunk in
                 Task { @MainActor in
@@ -2659,7 +2656,7 @@ struct ContentView: View {
             }
 
             do {
-                self.appBench("ai_process_call id=\(pipelineID)")
+                self.logAIProcessCall(pipelineID, postProcessingModelInfo, postProcessingInputChars)
                 let result = try await self.processTextWithAIMetrics(
                     normalizedTranscribedText,
                     overrideSystemPrompt: promptOverride,
@@ -4382,6 +4379,18 @@ extension ContentView {
 
     private func appBench(_ message: String) {
         DebugLogger.shared.benchmark("APP_BENCH", message: message, source: "AppBenchmark")
+    }
+
+    private func logAIProcessCall(
+        _ pipelineID: String,
+        _ modelInfo: (provider: String?, model: String?),
+        _ inputChars: Int
+    ) {
+        let provider = (modelInfo.provider ?? "unknown").replacingOccurrences(of: " ", with: "_")
+        let model = (modelInfo.model ?? "unknown").replacingOccurrences(of: " ", with: "_")
+        self.appBench(
+            "ai_process_call id=\(pipelineID) provider=\(provider) model=\(model) inputChars=\(inputChars)"
+        )
     }
 
     private func callOpenAIChat() async {

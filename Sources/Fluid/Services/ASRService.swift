@@ -2822,7 +2822,12 @@ final class ASRService: ObservableObject {
                 self.lastDictionaryTrainingResult = result
                 finalSource = "dictionaryTraining"
             } else {
-                self.benchmarkLog("final_executor_request")
+                let vocabularyProvider = provider as? FluidAudioProvider
+                self.benchmarkLog(
+                    "final_executor_request model=\(SettingsStore.shared.selectedSpeechModel.rawValue) " +
+                        "samples=\(pcm.count) vocabEnabled=\(vocabularyProvider?.isWordBoostingActive == true) " +
+                        "vocabTerms=\(vocabularyProvider?.boostedVocabularyTermsCount ?? 0)"
+                )
                 result = try await self.transcriptionExecutor.run(benchmarkSessionID: self.benchmarkSessionID) { [provider] in
                     let executionStartedAt = ProcessInfo.processInfo.systemUptime
                     DebugLogger.shared.info("ASR_BENCH t=\(executionStartedAt) final_executor_begin mainThread=\(Thread.isMainThread)", source: "ASRBenchmark")
