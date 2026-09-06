@@ -5,6 +5,7 @@
 //  Persistence manager for Transcription Mode history
 //
 
+import AppKit
 import Combine
 import Foundation
 
@@ -210,10 +211,32 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     @Published private(set) var entries: [TranscriptionHistoryEntry] = []
     @Published var selectedEntryID: UUID?
+    /// Last completed snapshot while a coalesced background refresh is pending.
+    /// Rendering must never scan history or schedule work.
+    @Published private(set) var todaySummary = TodaySummary(words: 0, transcriptions: 0)
+    private var todaySummaryTask: Task<Void, Never>?
+    private var todaySummaryRevision: UInt64 = 0
+    private var todaySummaryDay: DateInterval?
+    private var calendarObservers: [NSObjectProtocol] = []
+    private let summaryNow: () -> Date
+    private let summaryCalendar: () -> Calendar
 
-    init(writer: TranscriptionHistoryWriter = TranscriptionHistoryWriter()) {
+    init(
+        writer: TranscriptionHistoryWriter = TranscriptionHistoryWriter(),
+        summaryNow: @escaping () -> Date = Date.init,
+        summaryCalendar: @escaping () -> Calendar = { Calendar.current }
+    ) {
         self.writer = writer
+        self.summaryNow = summaryNow
+        self.summaryCalendar = summaryCalendar
+        self.observeSummaryCalendarChanges()
         self.loadEntries()
+    }
+
+    deinit {
+        for observer in self.calendarObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     // MARK: - Public Methods
@@ -265,6 +288,7 @@ final class TranscriptionHistoryStore: ObservableObject {
 
         // Insert at beginning (newest first)
         self.entries.insert(entry, at: 0)
+        self.refreshTodaySummary()
 
         self.persist(upserts: [entry])
         if audio != nil {
@@ -279,7 +303,11 @@ final class TranscriptionHistoryStore: ObservableObject {
         if let audio = self.entries.first(where: { $0.id == id })?.audio {
             DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
         }
+        let previousCount = self.entries.count
         self.entries.removeAll { $0.id == id }
+        if self.entries.count != previousCount {
+            self.refreshTodaySummary()
+        }
 
         // Clear selection if deleted
         if self.selectedEntryID == id {
@@ -296,7 +324,11 @@ final class TranscriptionHistoryStore: ObservableObject {
                 DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
             }
         }
+        let previousCount = self.entries.count
         self.entries.removeAll { ids.contains($0.id) }
+        if self.entries.count != previousCount {
+            self.refreshTodaySummary()
+        }
 
         if let selected = selectedEntryID, ids.contains(selected) {
             self.selectedEntryID = self.entries.first?.id
@@ -309,6 +341,7 @@ final class TranscriptionHistoryStore: ObservableObject {
     func clearAllHistory() {
         DictationAudioHistoryStore.shared.deleteAllAudioFiles()
         self.entries.removeAll()
+        self.refreshTodaySummary()
         self.selectedEntryID = nil
         self.persist(replacing: true)
 
@@ -351,6 +384,7 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     func restore(from payload: [TranscriptionHistoryEntry]) {
         self.entries = payload.sorted { $0.timestamp > $1.timestamp }
+        self.refreshTodaySummary()
         self.selectedEntryID = self.entries.first?.id
         self.persist(upserts: self.entries, replacing: true)
     }
@@ -430,6 +464,7 @@ final class TranscriptionHistoryStore: ObservableObject {
                 var merged = self.pendingReplacement ? [] : loaded.filter { !self.pendingDeletes.contains($0.id) && self.pendingUpserts[$0.id] == nil }
                 merged.append(contentsOf: self.pendingUpserts.values)
                 self.entries = merged.sorted { $0.timestamp > $1.timestamp }
+                self.refreshTodaySummary()
                 self.hasLoaded = true
                 self.persistenceError = nil
                 if self.pendingReplacement || !self.pendingUpserts.isEmpty || !self.pendingDeletes.isEmpty {
@@ -502,12 +537,77 @@ final class TranscriptionHistoryStore: ObservableObject {
             self.persistenceError = "History could not be saved. Keep FluidVoice open and retry. \(error.localizedDescription)"
         }
     }
+
+    // MARK: - Event-driven Today Snapshot
+
+    private func observeSummaryCalendarChanges() {
+        let names: [Notification.Name] = [
+            .NSCalendarDayChanged, .NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
+            NSLocale.currentLocaleDidChangeNotification, NSApplication.didBecomeActiveNotification,
+        ]
+        self.calendarObservers = names.map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshTodaySummaryForCalendarChange()
+                }
+            }
+        }
+    }
+
+    func refreshTodaySummaryForCalendarChange() {
+        let day = self.summaryCalendar().dateInterval(of: .day, for: self.summaryNow())
+        guard day != self.todaySummaryDay else { return }
+        self.refreshTodaySummary()
+    }
+
+    private func refreshTodaySummary() {
+        self.todaySummaryRevision &+= 1
+        guard self.todaySummaryTask == nil else { return }
+        self.todaySummaryTask = Task { @MainActor [weak self] in
+            // Coalesce synchronous load/restore/delete bursts into one immutable snapshot.
+            await Task.yield()
+            guard let self else { return }
+            while true {
+                let revision = self.todaySummaryRevision
+                let day = self.summaryCalendar().dateInterval(of: .day, for: self.summaryNow())
+                let snapshot = self.entries
+                let summary = await Task.detached(priority: .utility) {
+                    Self.calculateTodaySummary(entries: snapshot, day: day)
+                }.value
+                guard revision == self.todaySummaryRevision,
+                      day == self.summaryCalendar().dateInterval(of: .day, for: self.summaryNow())
+                else { continue }
+                self.todaySummaryDay = day
+                if self.todaySummary != summary {
+                    self.todaySummary = summary
+                }
+                // Published subscribers may synchronously mutate history again.
+                guard revision == self.todaySummaryRevision else { continue }
+                self.todaySummaryTask = nil
+                return
+            }
+        }
+    }
+
+    func waitForTodaySummary() async {
+        await self.todaySummaryTask?.value
+    }
+
+    private nonisolated static func calculateTodaySummary(entries: [TranscriptionHistoryEntry], day: DateInterval?) -> TodaySummary {
+        guard let day else { return TodaySummary(words: 0, transcriptions: 0) }
+        let totals = entries.reduce(into: (words: 0, transcriptions: 0)) { result, entry in
+            guard entry.timestamp >= day.start, entry.timestamp < day.end else { return }
+            result.words += Self.countWords(in: entry.processedText)
+            result.transcriptions += 1
+        }
+        return TodaySummary(words: totals.words, transcriptions: totals.transcriptions)
+    }
 }
 
 // MARK: - Stats Computation Extension
 
 extension TranscriptionHistoryStore {
-    struct TodaySummary {
+    nonisolated struct TodaySummary: Equatable, Sendable {
         let words: Int
         let transcriptions: Int
 
@@ -543,6 +643,10 @@ extension TranscriptionHistoryStore {
 
     /// Count words in a string (handles multiple spaces, newlines)
     private func wordCount(in text: String) -> Int {
+        Self.countWords(in: text)
+    }
+
+    private nonisolated static func countWords(in text: String) -> Int {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return 0 }
 
@@ -554,18 +658,6 @@ extension TranscriptionHistoryStore {
     /// Total words across all transcriptions
     var totalWords: Int {
         self.entries.reduce(0) { $0 + self.wordCount(in: $1.processedText) }
-    }
-
-    /// Summary for today's activity, calculated in one pass.
-    var todaySummary: TodaySummary {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let totals = self.entries.reduce(into: (words: 0, transcriptions: 0)) { result, entry in
-            guard calendar.isDate(entry.timestamp, inSameDayAs: today) else { return }
-            result.words += self.wordCount(in: entry.processedText)
-            result.transcriptions += 1
-        }
-        return TodaySummary(words: totals.words, transcriptions: totals.transcriptions)
     }
 
     /// Words transcribed today

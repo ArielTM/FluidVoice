@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import SQLite3
 
@@ -75,6 +76,8 @@ final class DebugLogger {
         store.attachAudio(audio, to: newID)
         store.deleteEntry(id: legacy[1].id)
         try await store.waitUntilLoaded()
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 2, transcriptions: 1), "Startup stats must include merged pending edits")
         await store.finishPendingWrites()
         precondition(defaults.data(forKey: key) == nil, "Retire legacy only after successful import")
         precondition(store.entries.count == 8400)
@@ -104,6 +107,8 @@ final class DebugLogger {
         }
         precondition(store.persistenceError != nil)
         precondition(store.entries.contains(where: { $0.id == failedID }))
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 3, transcriptions: 2), "A disk error must not drop in-memory stats")
         let afterFailure = try await writer.load()
         precondition(!afterFailure.contains(where: { $0.id == failedID }))
         store.retryPersistence()
@@ -155,6 +160,104 @@ final class DebugLogger {
         let afterRestore = try await TranscriptionHistoryWriter(defaults: defaults, url: url).load()
         precondition(afterRestore == [legacy[3]])
         print("PASS: restore during loading replaces both memory and disk")
+        try await self.testTodaySummary(root: root, defaults: defaults, audio: audio)
+    }
+
+    @MainActor static func testTodaySummary(root: URL, defaults: UserDefaults, audio: DictationAudioMetadata) async throws {
+        let formatter = ISO8601DateFormatter()
+        var now = formatter.date(from: "2026-03-08T18:00:00Z")!
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        var clockReads = 0
+        let writer = TranscriptionHistoryWriter(defaults: defaults, url: root.appendingPathComponent("summary.sqlite3"))
+        let store = TranscriptionHistoryStore(writer: writer, summaryNow: {
+            clockReads += 1
+            return now
+        }, summaryCalendar: { calendar })
+        try await store.waitUntilLoaded()
+        await store.waitForTodaySummary()
+        let day = calendar.dateInterval(of: .day, for: now)!
+        precondition(day.duration == 23 * 3600, "Fixture must exercise a DST-shortened day")
+        func entry(_ timestamp: Date, _ text: String) -> TranscriptionHistoryEntry {
+            TranscriptionHistoryEntry(timestamp: timestamp, rawText: text, processedText: text,
+                                      appName: "Test", windowTitle: "Test", wasAIProcessed: false)
+        }
+        let yesterday = entry(day.start.addingTimeInterval(-1), "not today")
+        let first = entry(day.start, "  one\t two\nthree  ")
+        let last = entry(day.end.addingTimeInterval(-1), "four")
+        let tomorrow = entry(day.end, "next day")
+        store.restore(from: [yesterday, first, last, tomorrow])
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 4, transcriptions: 2), "Preserve word splitting and half-open local-day boundaries")
+        let reads = clockReads
+        let unchangedEntries = store.entries
+        for _ in 0..<10_000 {
+            precondition(store.todaySummary.words == 4)
+        }
+        precondition(clockReads == reads, "Rendering must not query clock or schedule a recount")
+        store.attachAudio(audio, to: first.id)
+        await store.waitForTodaySummary()
+        precondition(clockReads == reads, "Audio-only metadata must not invalidate text stats")
+        precondition(store.entries.map(\.processedText) == unchangedEntries.map(\.processedText))
+        precondition(store.selectedEntryID == unchangedEntries.first?.id, "Summary work must not change selection")
+        store.deleteEntry(id: UUID())
+        store.deleteEntries(ids: [])
+        await store.waitForTodaySummary()
+        precondition(clockReads == reads, "No-op deletions must not schedule work")
+        print("PASS: constant-time stats reads, exact whitespace/DST boundaries, audio-only non-effects")
+
+        let additionID = UUID()
+        store.addEntry(id: additionID, timestamp: now, rawText: "new text", processedText: "new text", appName: "Test", windowTitle: "Test")
+        store.deleteEntry(id: first.id)
+        store.deleteEntries(ids: [last.id])
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 2, transcriptions: 1))
+        store.addEntry(timestamp: now, rawText: "", processedText: " \n ", appName: "Test", windowTitle: "Test")
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 2, transcriptions: 1))
+
+        // Bulk replacement followed by rapid changes must only publish the latest history.
+        store.restore(from: Array(repeating: first, count: 10_000))
+        await Task.yield()
+        store.restore(from: [yesterday, first, last, tomorrow])
+        store.deleteEntries(ids: [first.id, last.id])
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 0, transcriptions: 0), "Never apply a stale bulk-rebuild result")
+        var replacedFromSubscriber = false
+        let subscription = store.$todaySummary.sink { summary in
+            guard summary.words == 3, !replacedFromSubscriber else { return }
+            replacedFromSubscriber = true
+            store.restore(from: [yesterday, tomorrow])
+        }
+        store.restore(from: [first])
+        await store.waitForTodaySummary()
+        precondition(replacedFromSubscriber && store.todaySummary == .init(words: 0, transcriptions: 0), "Reentrant changes must not be lost during publication")
+        subscription.cancel()
+        print("PASS: insert/delete/bulk-delete/empty input and rapid replacement converge to latest snapshot")
+
+        now = day.end.addingTimeInterval(1)
+        store.refreshTodaySummaryForCalendarChange()
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 2, transcriptions: 1), "Midnight must refresh without a dictation")
+        now = day.end.addingTimeInterval(12 * 3600)
+        calendar.timeZone = TimeZone(secondsFromGMT: 14 * 3600)!
+        store.refreshTodaySummaryForCalendarChange()
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 0, transcriptions: 0), "Timezone changes must redefine today")
+        now = yesterday.timestamp
+        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        store.refreshTodaySummaryForCalendarChange()
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 2, transcriptions: 1), "Clock moving backward must refresh")
+        let settledReads = clockReads
+        store.refreshTodaySummaryForCalendarChange()
+        await store.waitForTodaySummary()
+        precondition(clockReads == settledReads + 1, "Activation within same day must not rebuild")
+        store.clearAllHistory()
+        await store.waitForTodaySummary()
+        precondition(store.todaySummary == .init(words: 0, transcriptions: 0))
+        await store.finishPendingWrites()
+        print("PASS: day/timezone/backward-clock changes, unchanged-day no-op, and clear")
     }
 
     static func sql(_ url: URL, _ command: String) throws {
