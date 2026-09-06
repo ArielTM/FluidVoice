@@ -2460,30 +2460,15 @@ struct ContentView: View {
             !promptTest.isActive &&
             !shouldUseAIOnStop &&
             !self.settings.spokenSendEnabled
-        var didRequestOverlayHideOnStop = false
         DebugLogger.shared.info(
             "Routing decision snapshot | activeMode=\(modeAtStop.rawValue) | rewrite=\(wasRewriteMode) | command=\(wasCommandMode) | overlay=\(NotchContentState.shared.mode.rawValue)",
             source: "ContentView"
         )
 
         self.clearActiveRecordingMode()
-
-        if shouldHideOverlayOnStop {
-            didRequestOverlayHideOnStop = true
-            DebugLogger.shared.debug("Hiding dictation overlay at stop path", source: "ContentView")
-            self.hideOverlayAsync(reason: "stop_path")
-        } else {
-            // Show "Transcribing" state before calling stop() when the overlay needs
-            // to remain available for prompt, command, rewrite, or AI feedback.
-            DebugLogger.shared.debug("Showing transcription processing state", source: "ContentView")
-            self.appBench("processing_ui_request status=Transcribing")
-            self.menuBarManager.setProcessing(true)
-            NotchOverlayManager.shared.updateTranscriptionText("Transcribing")
-            self.appBench("processing_ui_requested status=Transcribing")
-
-            // Give SwiftUI a chance to render the processing state before heavier work.
-            await Task.yield()
-        }
+        let stopOverlay = self.prepareOverlayForASRStop(
+            shouldHideOverlayOnStop: shouldHideOverlayOnStop
+        )
 
         // Stop the ASR service and wait for transcription to complete
         // The processing indicator will stay visible during this phase
@@ -2492,9 +2477,12 @@ struct ContentView: View {
         // Play the stop cue as soon as the audio engine has stopped, before the
         // (potentially slow) final transcription pass. Scoped to dictation only —
         // Command/Edit modes call asr.stop() without this callback.
-        let transcribedText = await asr.stop(onCaptureStopped: {
-            TranscriptionSoundPlayer.shared.playStopSound()
-        })
+        let transcribedText = await asr.stop(
+            onCaptureStopped: {
+                TranscriptionSoundPlayer.shared.playStopSound()
+            },
+            onFinalTranscriptionStarted: stopOverlay.onFinalTranscriptionStarted
+        )
         self.appBench("asr_stop_return elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - asrStopStartedAt) * 1000).rounded()))")
         let audioSnapshot = self.asr.consumeLastCompletedAudioSnapshot()
         let transcriptionDurationMilliseconds = self.asr.consumeLastFinalTranscriptionDurationMs()
@@ -2519,7 +2507,7 @@ struct ContentView: View {
                 }
             }
             // Finish the same short exit transition even when no text is emitted.
-            if !didRequestOverlayHideOnStop {
+            if !stopOverlay.didRequestHide {
                 await self.menuBarManager.finishProcessingAndHideOverlay()
             }
             return
@@ -2850,7 +2838,7 @@ struct ContentView: View {
             } else {
                 let expectedOverlayLifecycleID = self.overlayLifecycleID
                 let shouldHideOverlayAfterDelivery = !shouldShowAIProcessingFailure
-                    && !didRequestOverlayHideOnStop
+                    && !stopOverlay.didRequestHide
                 self.asr.typeOutputPlanToActiveField(
                     finalOutputPlan,
                     preferredTargetPID: typingTarget.pid,
@@ -2884,7 +2872,7 @@ struct ContentView: View {
             }
             NotchContentState.shared.setSpokenSendIndicatorState(.hidden)
             if !shouldShowAIProcessingFailure,
-               !didRequestOverlayHideOnStop,
+               !stopOverlay.didRequestHide,
                !didScheduleOverlayHideAfterDelivery
             {
                 NotchOverlayManager.shared.updateTranscriptionText("")
@@ -2892,9 +2880,40 @@ struct ContentView: View {
             }
         }
 
-        if !didTypeExternally, !shouldShowAIProcessingFailure, !didRequestOverlayHideOnStop {
+        if !didTypeExternally, !shouldShowAIProcessingFailure, !stopOverlay.didRequestHide {
             self.hideOverlayAfterOutput()
         }
+    }
+
+    private func prepareOverlayForASRStop(
+        shouldHideOverlayOnStop: Bool
+    ) -> (didRequestHide: Bool, onFinalTranscriptionStarted: (@MainActor () -> Void)?) {
+        if shouldHideOverlayOnStop {
+            DebugLogger.shared.debug("Hiding dictation overlay at stop path", source: "ContentView")
+            self.hideOverlayAsync(reason: "stop_path")
+            return (true, nil)
+        }
+
+        guard self.asr.isFinalTranscriptionReady else {
+            DebugLogger.shared.debug("Showing transcription processing state", source: "ContentView")
+            self.appBench("processing_ui_request status=Transcribing")
+            self.menuBarManager.setProcessing(true)
+            NotchOverlayManager.shared.updateTranscriptionText("Transcribing")
+            self.appBench("processing_ui_requested status=Transcribing")
+            return (false, nil)
+        }
+
+        // Own the overlay before isRunning changes, but publish processing UI
+        // only after final ASR has entered its executor.
+        self.menuBarManager.reserveProcessingOverlay()
+        self.appBench("processing_ui_reserved trigger=warm_final_asr")
+        let onFinalTranscriptionStarted: @MainActor () -> Void = {
+            self.appBench("processing_ui_request status=Transcribing trigger=final_executor")
+            self.menuBarManager.setProcessing(true)
+            NotchOverlayManager.shared.updateTranscriptionText("Transcribing")
+            self.appBench("processing_ui_requested status=Transcribing trigger=final_executor")
+        }
+        return (false, onFinalTranscriptionStarted)
     }
 
     private func hideOverlayForDispatchedPaste(shouldHide: Bool, lifecycleID: UInt64) {

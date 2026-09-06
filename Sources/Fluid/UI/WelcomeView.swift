@@ -690,7 +690,7 @@ struct OnboardingFlowView: View {
                 self.suspendOnboardingMicrophonePreviewForDictation()
             }
         }
-        .onChange(of: self.asr.audioCaptureStateSettledTick) { _, _ in
+        .onReceive(self.asr.audioCaptureStateDidSettle) {
             guard self.isOnboardingFlowVisible,
                   self.step == .permissions,
                   self.isMicrophoneReady

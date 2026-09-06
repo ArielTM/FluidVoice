@@ -362,19 +362,26 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         NotchOverlayManager.shared.setMode(mode)
     }
 
+    /// Keeps the recording overlay owned by the active pipeline without
+    /// publishing processing UI. The latency-critical stop path uses this so
+    /// SwiftUI work cannot queue ahead of final transcription.
+    func reserveProcessingOverlay() {
+        self.overlayBench(
+            "reserve_processing overlayVisible=\(self.overlayVisible) active=\(self.isProcessingActive)"
+        )
+        self.isProcessingActive = true
+        self.pendingProcessingShowOperation?.cancel()
+        self.pendingProcessingShowOperation = nil
+        self.pendingHideOperation?.cancel()
+        self.pendingHideOperation = nil
+        self.overlayVisible = true
+    }
+
     func setProcessing(_ processing: Bool) {
         self.overlayBench("set_processing_request processing=\(processing) overlayVisible=\(self.overlayVisible) active=\(self.isProcessingActive)")
 
-        // Track processing state to prevent hide during AI refinement
-        self.isProcessingActive = processing
-        self.updateMenuItemsText()
-
         if processing {
-            self.pendingProcessingShowOperation?.cancel()
-            // Cancel any pending hide - we want to keep the overlay visible for AI processing
-            self.pendingHideOperation?.cancel()
-            self.pendingHideOperation = nil
-            self.overlayVisible = true
+            self.reserveProcessingOverlay()
 
             let showItem = DispatchWorkItem { [weak self] in
                 guard let self = self, self.isProcessingActive else { return }
@@ -386,6 +393,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
             self.pendingProcessingShowOperation = showItem
             DispatchQueue.main.asyncAfter(deadline: .now() + self.processingVisualDelay, execute: showItem)
         } else {
+            self.isProcessingActive = false
             self.pendingProcessingShowOperation?.cancel()
             self.pendingProcessingShowOperation = nil
             // When processing ends, schedule the hide (unless expanded output is showing)

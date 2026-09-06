@@ -1,9 +1,29 @@
+import Combine
 import CoreAudio
 @testable import FluidVoice_Debug
 import Foundation
 import XCTest
 
 final class DirectAudioReliabilityTests: XCTestCase {
+    @MainActor
+    func testCaptureSettledEventDoesNotInvalidateWholeASRService() {
+        let service = ASRService()
+        var settledEventCount = 0
+        var objectChangeCount = 0
+        let settledCancellable = service.audioCaptureStateDidSettle.sink {
+            settledEventCount += 1
+        }
+        let objectCancellable = service.objectWillChange.sink {
+            objectChangeCount += 1
+        }
+
+        service.audioCaptureStateDidSettle.send()
+
+        XCTAssertEqual(settledEventCount, 1)
+        XCTAssertEqual(objectChangeCount, 0)
+        withExtendedLifetime((settledCancellable, objectCancellable)) {}
+    }
+
     func testStopUIInvalidationGateFinishesExactlyOnce() {
         var gate = ASRStopUIInvalidationGate()
 

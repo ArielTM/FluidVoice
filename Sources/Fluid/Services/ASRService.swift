@@ -407,12 +407,19 @@ final class ASRService: ObservableObject {
     @Published private(set) var isDictionaryTrainingCaptureActive: Bool = false
     @Published private(set) var isMicrophonePreviewActive: Bool = false
     @Published private(set) var microphonePreviewError: String?
-    @Published private(set) var audioCaptureStateSettledTick: UInt64 = 0
+    /// Narrow lifecycle event used only by onboarding microphone preview.
+    /// This must not invalidate every ASR-observing view after each capture.
+    let audioCaptureStateDidSettle = PassthroughSubject<Void, Never>()
     let deferredStopUIInvalidationDidFlush = PassthroughSubject<Void, Never>()
     private var stopUIInvalidationGate = ASRStopUIInvalidationGate()
     private var stopUIInvalidationTimeoutTask: Task<Void, Never>?
+    private var isStoppingFinalTranscription = false
     var defersStopUIInvalidation: Bool {
         self.stopUIInvalidationGate.isDeferring
+    }
+
+    var isFinalTranscriptionReady: Bool {
+        self.isAsrReady && self.transcriptionProvider.isReady
     }
 
     private var microphonePreviewOperationGeneration: UInt64 = 0
@@ -1428,7 +1435,10 @@ final class ASRService: ObservableObject {
             onCaptureHealth: { [weak self] sessionID, attemptID, audioMs, sampleCount, rms, peak in
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    guard sessionID == self.benchmarkSessionID, self.isRunning else { return }
+                    guard sessionID == self.benchmarkSessionID,
+                          self.isRunning,
+                          self.isStoppingFinalTranscription == false
+                    else { return }
                     let silent = rms < 0.002 && peak < 0.01
                     self.benchmarkLog(
                         "capture_health attempt=\(attemptID) audioMs=\(audioMs) " +
@@ -2251,7 +2261,7 @@ final class ASRService: ObservableObject {
             // handled explicitly below.
             if SettingsStore.shared.pauseMediaDuringTranscription {
                 let didPause = await MediaPlaybackService.shared.pauseIfPlaying()
-                guard self.isRunning else {
+                guard self.isRunning, self.isStoppingFinalTranscription == false else {
                     if didPause {
                         await MediaPlaybackService.shared.resumeIfWePaused(true)
                     }
@@ -2468,7 +2478,7 @@ final class ASRService: ObservableObject {
     private func finishAudioCaptureStart() {
         self.isStarting = false
         let deferredRecovery = self.deferredBluetoothStartupRouteRecovery.take()
-        self.audioCaptureStateSettledTick &+= 1
+        self.audioCaptureStateDidSettle.send()
         let waiters = self.audioCaptureStartWaiters
         self.audioCaptureStartWaiters.removeAll(keepingCapacity: false)
         waiters.forEach { $0.resume() }
@@ -2579,8 +2589,12 @@ final class ASRService: ObservableObject {
     ///   final transcription pass. Use this for immediate stop cues that
     ///   shouldn't wait on finalization. Only invoked when capture was actually
     ///   running (i.e. not when `stop()` early-returns because `isRunning` is false).
+    /// - Parameter onFinalTranscriptionStarted: Optional main-actor callback
+    ///   scheduled only after the final transcription executor starts. It is
+    ///   not awaited, so UI work cannot delay the provider call.
     func stop(
         onCaptureStopped: (@MainActor () -> Void)? = nil,
+        onFinalTranscriptionStarted: (@MainActor () -> Void)? = nil,
         forDictionaryTraining: Bool = false
     ) async -> String {
         DebugLogger.shared.info("🛑 STOP() called - beginning shutdown sequence", source: "ASRService")
@@ -2606,10 +2620,16 @@ final class ASRService: ObservableObject {
             DebugLogger.shared.warning("STOP() ignored - recording buffer handoff already active", source: "ASRService")
             return ""
         }
+        self.isStoppingFinalTranscription = true
         var completedBufferHandoff = false
         defer {
             if completedBufferHandoff == false {
                 self.recordingBufferHandoffGate.complete(bufferHandoffToken)
+            }
+            self.publishStoppedState(for: stoppingSessionID)
+            self.finishDeferredStopUIInvalidation()
+            if self.benchmarkSessionID == stoppingSessionID {
+                self.isStoppingFinalTranscription = false
             }
         }
         self.stopStreamingScheduler(sessionID: stoppingSessionID)
@@ -2638,13 +2658,6 @@ final class ASRService: ObservableObject {
         // without appending audio from the next session.
         self.audioCapturePipeline.markRecordingEnd(atHostTime: mach_absolute_time())
 
-        // Set isRunning to false before teardown so in-flight ASR chunks stop safely.
-        DebugLogger.shared.debug("🚫 Setting isRunning = false...", source: "ASRService")
-        self.beginDeferredStopUIInvalidation()
-        defer { self.finishDeferredStopUIInvalidation() }
-        self.isRunning = false
-        DebugLogger.shared.debug("✅ isRunning disabled", source: "ASRService")
-
         // Stop monitoring device to prevent callbacks after stop
         DebugLogger.shared.debug("👁️ Stopping device monitoring...", source: "ASRService")
         self.stopMonitoringDevice()
@@ -2655,7 +2668,6 @@ final class ASRService: ObservableObject {
         self.benchmarkLog("capture_stop_await_return")
         self.audioCapturePipeline.finishRecording()
         self.benchmarkLog("capture_pipeline_finished")
-        self.audioCaptureStateSettledTick &+= 1
 
         // A prepared direct IOProc owns only fixed memory and registration; it
         // does not run hardware, show the mic indicator, or hold Bluetooth in
@@ -2790,7 +2802,7 @@ final class ASRService: ObservableObject {
             if self.isAsrReady, provider.isReady {
                 self.benchmarkLog("stop_ensure_ready skipped=true elapsedMs=0")
             } else {
-                self.finishDeferredStopUIInvalidation()
+                self.publishStoppedState(for: stoppingSessionID)
                 DebugLogger.shared.debug("🔍 Calling ensureAsrReady()...", source: "ASRService")
                 try await self.ensureAsrReady()
                 provider = self.transcriptionProvider
@@ -2816,7 +2828,7 @@ final class ASRService: ObservableObject {
             let finalSource: String
             if useDictionaryTrainingPath {
                 result = try await self.transcriptionExecutor.run { [provider] in
-                    self.finishDeferredStopUIInvalidation()
+                    self.publishStoppedState(for: stoppingSessionID)
                     return try await provider.transcribeDictionaryTraining(pcm)
                 }
                 self.lastDictionaryTrainingResult = result
@@ -2831,7 +2843,15 @@ final class ASRService: ObservableObject {
                 result = try await self.transcriptionExecutor.run(benchmarkSessionID: self.benchmarkSessionID) { [provider] in
                     let executionStartedAt = ProcessInfo.processInfo.systemUptime
                     DebugLogger.shared.info("ASR_BENCH t=\(executionStartedAt) final_executor_begin mainThread=\(Thread.isMainThread)", source: "ASRBenchmark")
-                    self.finishDeferredStopUIInvalidation()
+                    self.publishStoppedState(for: stoppingSessionID)
+                    if let onFinalTranscriptionStarted {
+                        self.benchmarkLog("final_started_callback_scheduled")
+                        Task { @MainActor in
+                            self.benchmarkLog("final_started_callback_begin")
+                            onFinalTranscriptionStarted()
+                            self.benchmarkLog("final_started_callback_end")
+                        }
+                    }
                     defer {
                         DebugLogger.shared.info("ASR_BENCH t=\(ProcessInfo.processInfo.systemUptime) final_executor_end", source: "ASRBenchmark")
                     }
@@ -2947,6 +2967,26 @@ final class ASRService: ObservableObject {
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard Task.isCancelled == false else { return }
             self?.finishDeferredStopUIInvalidation()
+        }
+    }
+
+    /// Publishes the stopped state only after final ASR has entered its
+    /// executor. Streaming ownership is revoked earlier by the scheduler and
+    /// buffer handoff gates, so this keeps SwiftUI work off hardware teardown.
+    private func publishStoppedState(for sessionID: Int) {
+        guard self.benchmarkSessionID == sessionID, self.isRunning else { return }
+        DebugLogger.shared.debug("🚫 Publishing isRunning = false...", source: "ASRService")
+        self.beginDeferredStopUIInvalidation()
+        self.isRunning = false
+        self.isStoppingFinalTranscription = false
+        DebugLogger.shared.debug("✅ isRunning disabled", source: "ASRService")
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self,
+                  self.benchmarkSessionID == sessionID,
+                  self.isRunning == false
+            else { return }
+            self.audioCaptureStateDidSettle.send()
         }
     }
 
@@ -3139,7 +3179,7 @@ final class ASRService: ObservableObject {
 
         // Cancel/no-transcription paths stay conservative and retire the engine.
         await self.retireAudioEngineAndWait(reason: "stop_without_transcription")
-        self.audioCaptureStateSettledTick &+= 1
+        self.audioCaptureStateDidSettle.send()
 
         await self.drainActiveStreamingWork(sessionID: stoppingSessionID)
 
