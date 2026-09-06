@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 MARKER = re.compile(
-    r"\b(APP_BENCH|ASR_BENCH|FI_BRIDGE_BENCH|OVERLAY_BENCH|TYPING_BENCH|HISTORY_BENCH|PIPELINE_SUMMARY)\b(.*)"
+    r"\b(APP_BENCH|ASR_BENCH|FI_BRIDGE_BENCH|LLM_BENCH|OVERLAY_BENCH|TYPING_BENCH|HISTORY_BENCH|PIPELINE_SUMMARY)\b(.*)"
 )
 FIELD = re.compile(r"(?:^|\s)(\w+)=([^\s]+)")
 WALL = re.compile(r"^\[([\d:.]+)\]")
@@ -124,6 +124,13 @@ def summarize(run):
         "ai_model_return": time(find("FI_BRIDGE_BENCH", {"run_return"}, after)),
         "ai_bridge_return": time(find("FI_BRIDGE_BENCH", {"enhance_return"}, after)),
         "ai_private_return": time(find("APP_BENCH", {"ai_private_return"}, after)),
+        "llm_call_enter": time(find("LLM_BENCH", {"call_enter"}, after)),
+        "llm_request_built": time(find("LLM_BENCH", {"request_built"}, after)),
+        "llm_attempt_start": time(find("LLM_BENCH", {"attempt_start"}, after)),
+        "llm_response": time(find("LLM_BENCH", {"response_headers", "response_data"}, after)),
+        "llm_first_content": time(find("LLM_BENCH", {"first_content"}, after)),
+        "llm_response_decoded": time(find("LLM_BENCH", {"response_decoded"}, after)),
+        "llm_call_return": time(find("LLM_BENCH", {"call_return"}, after)),
         "ai_return": time(find("APP_BENCH", {"ai_process_return"}, after)),
         "text_ready": time(find("APP_BENCH", {"text_ready"}, after)),
         "paste_dispatch": time(find("TYPING_BENCH", {"asr_type_dispatched"}, after)),
@@ -178,6 +185,22 @@ def summarize(run):
         "ai_model_envelope_ms": delta(phases["ai_model_return"], phases["ai_model_call"]),
         "ai_bridge_tail_ms": delta(phases["ai_bridge_return"], phases["ai_model_return"]),
         "ai_return_hop_ms": delta(phases["ai_private_return"], phases["ai_bridge_return"]),
+        "llm_setup_ms": delta(phases["llm_call_enter"], phases["ai_route_resolved"]),
+        "llm_request_build_ms": delta(phases["llm_request_built"], phases["llm_call_enter"]),
+        "llm_transport_to_response_ms": delta(phases["llm_response"], phases["llm_attempt_start"]),
+        "llm_transport_to_first_content_ms": delta(
+            phases["llm_first_content"]
+            if phases["llm_first_content"] is not None
+            else phases["llm_response"],
+            phases["llm_attempt_start"],
+        ),
+        "llm_decode_tail_ms": delta(
+            phases["llm_response_decoded"],
+            phases["llm_first_content"]
+            if phases["llm_first_content"] is not None
+            else phases["llm_response"],
+        ),
+        "llm_return_hop_ms": delta(phases["ai_return"], phases["llm_call_return"]),
         "ai_processing_ms": delta(phases["ai_return"], phases["ai_call"]),
         "ai_to_ready_ms": delta(phases["text_ready"], phases["ai_return"]),
         "internal_stop_to_ready_ms": delta(phases["text_ready"], stop),
@@ -240,6 +263,16 @@ def render(rows, details=False):
             values = [m["ai_route_ms"], m["ai_call_to_bridge_ms"], m["ai_bridge_setup_ms"],
                       m["ai_model_envelope_ms"], m["ai_bridge_tail_ms"], m["ai_return_hop_ms"],
                       m["ai_processing_ms"]]
+            lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | " + " | ".join(map(fmt, values)) + " |")
+    if any(row["metrics"]["llm_request_build_ms"] is not None for row in rows):
+        lines += ["", "## External AI handoff detail", "",
+                  "| Time / ID | Route→client | Request build | Transport→headers | Transport→first text | Decode tail | Return hop | AI total |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|"]
+        for row in rows:
+            m = row["metrics"]
+            values = [m["llm_setup_ms"], m["llm_request_build_ms"],
+                      m["llm_transport_to_response_ms"], m["llm_transport_to_first_content_ms"],
+                      m["llm_decode_tail_ms"], m["llm_return_hop_ms"], m["ai_processing_ms"]]
             lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | " + " | ".join(map(fmt, values)) + " |")
     if details:
         for row in rows:

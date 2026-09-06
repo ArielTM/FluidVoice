@@ -2203,7 +2203,8 @@ struct ContentView: View {
         overrideProviderID: String? = nil,
         overrideModel: String? = nil,
         dictationSlot: SettingsStore.DictationShortcutSlot? = nil,
-        streamHandler: PrivateAIStreamHandler? = nil
+        streamHandler: PrivateAIStreamHandler? = nil,
+        benchmarkID: String? = nil
     ) async throws -> String {
         try await self.processTextWithAIMetrics(
             inputText,
@@ -2211,7 +2212,8 @@ struct ContentView: View {
             overrideProviderID: overrideProviderID,
             overrideModel: overrideModel,
             dictationSlot: dictationSlot,
-            streamHandler: streamHandler
+            streamHandler: streamHandler,
+            benchmarkID: benchmarkID
         ).text
     }
 
@@ -2221,7 +2223,8 @@ struct ContentView: View {
         overrideProviderID: String? = nil,
         overrideModel: String? = nil,
         dictationSlot: SettingsStore.DictationShortcutSlot? = nil,
-        streamHandler: PrivateAIStreamHandler? = nil
+        streamHandler: PrivateAIStreamHandler? = nil,
+        benchmarkID: String? = nil
     ) async throws -> AITextProcessingResult {
         let routeStartedAt = ProcessInfo.processInfo.systemUptime
         let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
@@ -2420,7 +2423,8 @@ struct ContentView: View {
             streaming: enableStreaming,
             tools: [],
             temperature: isTemperatureUnsupported ? nil : 0.2,
-            extraParameters: extraParams
+            extraParameters: extraParams,
+            benchmarkID: benchmarkID
         )
         if enableStreaming {
             config.onContentChunk = { chunk in
@@ -2447,7 +2451,8 @@ struct ContentView: View {
                     streaming: false,
                     tools: [],
                     temperature: isTemperatureUnsupported ? nil : 0.2,
-                    extraParameters: extraParams
+                    extraParameters: extraParams,
+                    benchmarkID: benchmarkID
                 )
                 response = try await LLMClient.shared.call(fallbackConfig)
             }
@@ -2693,7 +2698,8 @@ struct ContentView: View {
                     normalizedTranscribedText,
                     overrideSystemPrompt: promptOverride,
                     dictationSlot: activeDictationSlot,
-                    streamHandler: streamHandler
+                    streamHandler: streamHandler,
+                    benchmarkID: pipelineID
                 )
                 finalText = result.text
                 self.appBench("ai_process_return id=\(pipelineID)")

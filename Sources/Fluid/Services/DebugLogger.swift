@@ -24,15 +24,34 @@ final nonisolated class DebugLogger: @unchecked Sendable {
 
     func log(_ message: String, level: LogLevel = .info, source: String = "App") {
         self.queue.async {
-            let timestamp = Date()
-            let timestampString = Self.logFormatter.string(from: timestamp)
-
-            let formattedLine = self.formatLogLine(timestamp: timestampString, level: level, source: source, message: message)
-
-            // Always persist diagnostics so issues can be debugged even if UI debug mode is off.
-            FileLogger.shared.append(line: formattedLine)
-            print(formattedLine)
+            self.write(message, level: level, source: source)
         }
+    }
+
+    /// Defers expensive diagnostic string construction until after latency-sensitive
+    /// work has continued on the caller's executor.
+    func logLazy(
+        level: LogLevel = .info,
+        source: String = "App",
+        _ message: @escaping @Sendable () -> String
+    ) {
+        self.queue.async {
+            self.write(message(), level: level, source: source)
+        }
+    }
+
+    private func write(_ message: String, level: LogLevel, source: String) {
+        let timestampString = Self.logFormatter.string(from: Date())
+        let formattedLine = self.formatLogLine(
+            timestamp: timestampString,
+            level: level,
+            source: source,
+            message: message
+        )
+
+        // Always persist diagnostics so issues can be debugged even if UI debug mode is off.
+        FileLogger.shared.append(line: formattedLine)
+        print(formattedLine)
     }
 
     private func formatLogLine(timestamp: String, level: LogLevel, source: String, message: String) -> String {

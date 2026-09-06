@@ -116,6 +116,30 @@ class DictationLogSummaryTests(unittest.TestCase):
         self.assertEqual(result["context"]["ai_provider"], "FluidIntelligence")
         self.assertEqual(result["context"]["ai_model"], "fluid-1")
 
+    def test_external_llm_handoff_breakdown(self):
+        result = self.parse(
+            row("APP_BENCH", 1, "begin_recording"),
+            row("APP_BENCH", 2, "pipeline_begin id=A"),
+            row("APP_BENCH", 2.100, "ai_process_call id=A provider=OpenAI model=gpt-5 inputChars=40"),
+            row("APP_BENCH", 2.102, "ai_route_resolved elapsedMs=2"),
+            row("LLM_BENCH", 2.105, "id=A call_enter"),
+            row("LLM_BENCH", 2.106, "id=A request_built bodyBytes=900"),
+            row("LLM_BENCH", 2.107, "id=A attempt_start attempt=1"),
+            row("LLM_BENCH", 2.120, "id=A response_headers"),
+            row("LLM_BENCH", 2.150, "id=A first_content"),
+            row("LLM_BENCH", 2.170, "id=A response_decoded"),
+            row("LLM_BENCH", 2.171, "id=A call_return"),
+            row("APP_BENCH", 2.172, "ai_process_return id=A"),
+        )[0]
+
+        self.assertEqual(result["metrics"]["llm_setup_ms"], 3)
+        self.assertEqual(result["metrics"]["llm_request_build_ms"], 1)
+        self.assertEqual(result["metrics"]["llm_transport_to_response_ms"], 13)
+        self.assertEqual(result["metrics"]["llm_transport_to_first_content_ms"], 43)
+        self.assertEqual(result["metrics"]["llm_decode_tail_ms"], 20)
+        self.assertEqual(result["metrics"]["llm_return_hop_ms"], 1)
+        self.assertIn("External AI handoff detail", render([result]))
+
 
 if __name__ == "__main__":
     unittest.main()
