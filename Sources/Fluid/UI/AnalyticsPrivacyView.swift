@@ -32,6 +32,7 @@ struct AnalyticsPrivacyView: View {
                     self.sectionTitle("Always collected")
                     self.bullet("A random installation ID, app version, the operating-system label macOS, and basic hardware info.")
                     self.bullet("One active-use signal per local day after you interact with the app, buffered on this Mac and sent weekly.")
+                    self.bullet("Beta builds also send one daily aggregate of ASR and Fluid Intelligence timing distributions, including macOS version. No individual timing samples are sent.")
 
                     self.sectionTitle("When detailed analytics is enabled")
                     self.bullet("Daily totals for Dictation, Command Mode, Edit Mode, and meeting transcription.")
@@ -44,15 +45,16 @@ struct AnalyticsPrivacyView: View {
                     self.bullet("Selected text, rewrite prompts, or AI responses.")
                     self.bullet("Terminal commands or outputs from Command Mode.")
                     self.bullet("Window titles, app names, file names/paths, clipboard contents, or anything you type.")
-                    self.bullet("Hardware serial numbers or other unique device identifiers, performance timings, or individual transcription events.")
+                    self.bullet("Hardware serial numbers, other unique device identifiers, or individual transcription events.")
 
                     self.sectionTitle("How it’s used")
                     self.bullet("Daily activity measures active installations and retention without requiring accounts.")
                     self.bullet("Optional detailed analytics helps us understand feature adoption, onboarding completion, and model usage.")
+                    self.bullet("Beta timing summaries help us compare ASR and Fluid Intelligence speed across Mac hardware and macOS versions.")
 
                     self.sectionTitle("Control")
                     self.bullet("You can disable detailed analytics anytime in Settings → Share Detailed Anonymous Analytics.")
-                    self.bullet("Disabling detailed analytics securely removes its queued and aggregated data from this Mac. The daily activity signal remains enabled.")
+                    self.bullet("Disabling detailed analytics securely removes its queued and aggregated data from this Mac. Daily activity and beta timing summaries remain enabled.")
                 }
                 .padding(.vertical, 6)
             }

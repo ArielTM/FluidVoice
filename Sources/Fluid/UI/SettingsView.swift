@@ -966,7 +966,7 @@ struct SettingsView: View {
                                     self.optionToggleRow(
                                         title: "Share Detailed Anonymous Analytics",
                                         description: "Share anonymous daily feature, onboarding, and model metrics. " +
-                                            "When off, FluidVoice records one anonymous activity signal per day and sends them weekly to measure active use. " +
+                                            "When off, FluidVoice still records the anonymous daily activity signal and, in beta builds, daily ASR and Fluid Intelligence timing summaries. " +
                                             "Never includes transcription text or prompts.",
                                         isOn: self.detailedAnalyticsToggleBinding
                                     )

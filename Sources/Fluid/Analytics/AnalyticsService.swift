@@ -63,6 +63,20 @@ final class AnalyticsService {
         }
     }
 
+    /// Beta builds aggregate these timings locally and emit one summary per day.
+    func recordBetaDictationPerformance(
+        asrMilliseconds: Int?,
+        fluidIntelligenceMilliseconds: Int?
+    ) {
+        self.submit { core, context in
+            await core.recordBetaDictationPerformance(
+                asrMilliseconds: asrMilliseconds,
+                fluidIntelligenceMilliseconds: fluidIntelligenceMilliseconds,
+                context: context
+            )
+        }
+    }
+
     func recordOnboardingStarted(origin: AnalyticsOnboardingOrigin) {
         self.submit { core, context in
             await core.recordOnboardingStarted(origin: origin, context: context)
@@ -195,7 +209,9 @@ final class AnalyticsService {
             detailedConsentGeneration: detailedConsentGeneration,
             config: AnalyticsConfig.fromBundle(),
             distinctID: AnalyticsIdentityStore.shared.anonymousInstallID,
-            appVersion: version
+            appVersion: version,
+            collectsBetaPerformance: AnalyticsBuildPolicy
+                .automaticallyCollectsDictationPerformance(appVersion: version)
         )
     }
 }
@@ -206,6 +222,7 @@ private struct AnalyticsContext {
     let config: AnalyticsConfig
     let distinctID: String
     let appVersion: String
+    let collectsBetaPerformance: Bool
 }
 
 final nonisolated class DetailedAnalyticsConsentGate: @unchecked Sendable {
@@ -250,8 +267,8 @@ private actor AnalyticsCore {
             }
             guard context.config.isConfigured else { return }
             let database = try self.database(for: context)
+            try database.finalizeDays(before: Date())
             if context.detailedAnalyticsEnabled {
-                try database.finalizeDays(before: Date())
                 try database.recoverInterruptedModelDownloads(at: Date())
             }
             self.startFlushLoopIfNeeded()
@@ -298,6 +315,28 @@ private actor AnalyticsCore {
     ) async {
         await self.writeDetailed(context: context, fallbackActivity: .coreAction) { database, date in
             try database.recordModelUsage(role: role, mode: mode, descriptor: descriptor, at: date)
+        }
+    }
+
+    func recordBetaDictationPerformance(
+        asrMilliseconds: Int?,
+        fluidIntelligenceMilliseconds: Int?,
+        context: AnalyticsContext
+    ) async {
+        guard context.collectsBetaPerformance,
+              context.config.isConfigured
+        else { return }
+        do {
+            let database = try self.database(for: context)
+            try database.recordDictationPerformance(
+                asrMilliseconds: asrMilliseconds,
+                fluidIntelligenceMilliseconds: fluidIntelligenceMilliseconds,
+                measuredAppVersion: context.appVersion,
+                at: Date()
+            )
+            self.startFlushLoopIfNeeded()
+        } catch {
+            return
         }
     }
 
@@ -537,9 +576,7 @@ private actor AnalyticsCore {
 
         let items: [AnalyticsOutboxItem]
         do {
-            if context.detailedAnalyticsEnabled {
-                try database.finalizeDays(before: Date())
-            }
+            try database.finalizeDays(before: Date())
             items = try database.readyOutbox(limit: self.batchSize, at: Date())
         } catch {
             return

@@ -978,6 +978,26 @@ struct ContentView: View {
         )
     }
 
+    private func recordDictationUsage(
+        shouldUseAI: Bool,
+        dictationSlot: SettingsStore.DictationShortcutSlot?,
+        appBundleID: String
+    ) -> (provider: String?, model: String?) {
+        let postProcessing = self.currentDictationAIModelInfo(
+            dictationSlot: dictationSlot,
+            appBundleID: appBundleID
+        )
+        AnalyticsService.shared.recordUsage(
+            mode: .dictation,
+            transcriptionModel: self.settings.selectedSpeechModel.analyticsDescriptor,
+            aiModel: shouldUseAI ? AnalyticsModelDescriptor(
+                provider: postProcessing.provider ?? "unknown",
+                model: postProcessing.model ?? "unknown"
+            ) : nil
+        )
+        return postProcessing
+    }
+
     // MARK: - Mode Transition Handler
 
     /// Centralized handler for sidebar mode transitions to ensure proper cleanup and state management
@@ -2227,6 +2247,7 @@ struct ContentView: View {
     private struct AITextProcessingResult {
         let text: String
         let tokensPerSecond: Double?
+        let fluidIntelligenceLatencyMilliseconds: Int?
     }
 
     private func processTextWithAI(
@@ -2305,6 +2326,7 @@ struct ContentView: View {
             }
 
             self.appBench("ai_private_call")
+            let fluidIntelligenceStartedAt = ProcessInfo.processInfo.systemUptime
             let response = try await PrivateAIIntegrationService.shared.enhanceDictation(
                 inputText,
                 runtime: PrivateAIIntegrationService.RuntimeConfiguration(
@@ -2334,9 +2356,13 @@ struct ContentView: View {
             let tokensPerSecond = response.tokensPerSecond.flatMap { value in
                 value.isFinite && value > 0 ? value : nil
             }
+            let fluidIntelligenceLatencyMilliseconds = Int(
+                ((ProcessInfo.processInfo.systemUptime - fluidIntelligenceStartedAt) * 1000).rounded()
+            )
             return AITextProcessingResult(
                 text: response.outputText,
-                tokensPerSecond: tokensPerSecond
+                tokensPerSecond: tokensPerSecond,
+                fluidIntelligenceLatencyMilliseconds: fluidIntelligenceLatencyMilliseconds
             )
         }
 
@@ -2512,7 +2538,11 @@ struct ContentView: View {
         guard !response.content.isEmpty else {
             throw AIProcessingError.emptyResponse
         }
-        return AITextProcessingResult(text: response.content, tokensPerSecond: nil)
+        return AITextProcessingResult(
+            text: response.content,
+            tokensPerSecond: nil,
+            fluidIntelligenceLatencyMilliseconds: nil
+        )
     }
 
     // MARK: - Streaming Response Handler (DEPRECATED - Now handled by LLMClient)
@@ -2594,6 +2624,9 @@ struct ContentView: View {
                 } else {
                     AnalyticsService.shared.recordOnboardingTryoutAttemptResult(outcome: .empty)
                 }
+            }
+            if route == .normal, !wasRewriteMode, !wasCommandMode, !promptTest.isActive {
+                self.recordEmptyDictationPerformance(startedAt: pipelineStartedAt, asrMs: transcriptionDurationMilliseconds)
             }
             // Finish the same short exit transition even when no text is emitted.
             if !stopOverlay.didRequestHide {
@@ -2679,6 +2712,7 @@ struct ContentView: View {
         var aiFallbackReason: String?
         var postProcessingModel: String?
         var aiProcessingDurationMilliseconds: Int?
+        var fluidIntelligenceDurationMilliseconds: Int?
         var aiTokensPerSecond: Double?
         var aiFallbackNotificationError: String?
         let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
@@ -2702,17 +2736,10 @@ struct ContentView: View {
             DictationAIPostProcessingGate.isConfigured(for: $0, appBundleID: appInfo.bundleId)
         } ?? DictationAIPostProcessingGate.isConfigured(for: .primary, appBundleID: appInfo.bundleId))
         let transcriptionModelInfo = self.currentTranscriptionModelInfo()
-        let postProcessingModelInfo = self.currentDictationAIModelInfo(
+        let postProcessingModelInfo = self.recordDictationUsage(
+            shouldUseAI: shouldUseAI,
             dictationSlot: activeDictationSlot,
             appBundleID: appInfo.bundleId
-        )
-        AnalyticsService.shared.recordUsage(
-            mode: .dictation,
-            transcriptionModel: self.settings.selectedSpeechModel.analyticsDescriptor,
-            aiModel: shouldUseAI ? AnalyticsModelDescriptor(
-                provider: postProcessingModelInfo.provider ?? "unknown",
-                model: postProcessingModelInfo.model ?? "unknown"
-            ) : nil
         )
 
         if shouldUseAI {
@@ -2742,6 +2769,7 @@ struct ContentView: View {
                 finalText = result.text
                 self.appBench("ai_process_return id=\(pipelineID)")
                 aiTokensPerSecond = result.tokensPerSecond
+                fluidIntelligenceDurationMilliseconds = result.fluidIntelligenceLatencyMilliseconds
                 streamPreview.flush()
                 self.appBench("ai_preview_flushed id=\(pipelineID)")
             } catch {
@@ -2808,6 +2836,15 @@ struct ContentView: View {
 
         DebugLogger.shared.info("Transcription finalized (chars: \(finalText.count))", source: "ContentView")
         let finalTextReadyAt = ProcessInfo.processInfo.systemUptime
+        self.recordCompletedDictationPerformance(
+            route: route,
+            pipelineStartedAt: pipelineStartedAt,
+            readyAt: finalTextReadyAt,
+            transcriptionDurationMilliseconds: transcriptionDurationMilliseconds,
+            aiProcessingDurationMilliseconds: aiProcessingDurationMilliseconds,
+            fluidIntelligenceDurationMilliseconds: fluidIntelligenceDurationMilliseconds,
+            outcome: aiFallbackReason == nil ? "success" : "ai_fallback"
+        )
         let finalOutputPlan = ASRService.makeDictationLiteralOutputPlan(
             for: finalText,
             appName: appInfo.name,
@@ -3071,6 +3108,43 @@ struct ContentView: View {
         // Ordinary dictation already hid in the dispatch turn and returns above.
         self.appBench("overlay_hide_request reason=delivery_complete outcome=\(outcome)")
         self.menuBarManager.beginProcessingCompletionAndHideOverlay()
+    }
+
+    private func recordCompletedDictationPerformance(
+        route: DictationOutputRoute,
+        pipelineStartedAt: TimeInterval,
+        readyAt: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        transcriptionDurationMilliseconds: Int?,
+        aiProcessingDurationMilliseconds: Int?,
+        fluidIntelligenceDurationMilliseconds: Int?,
+        outcome: String
+    ) {
+        guard route == .normal else { return }
+        let readyMilliseconds = Int(((readyAt - pipelineStartedAt) * 1000).rounded())
+        DebugLogger.shared.info(
+            DictationPerformanceLogSummary.line(
+                asrMilliseconds: transcriptionDurationMilliseconds,
+                aiMilliseconds: aiProcessingDurationMilliseconds,
+                readyMilliseconds: readyMilliseconds,
+                outcome: outcome
+            ),
+            source: "AppBenchmark"
+        )
+        AnalyticsService.shared.recordBetaDictationPerformance(
+            asrMilliseconds: transcriptionDurationMilliseconds,
+            fluidIntelligenceMilliseconds: fluidIntelligenceDurationMilliseconds
+        )
+    }
+
+    private func recordEmptyDictationPerformance(startedAt: TimeInterval, asrMs: Int?) {
+        self.recordCompletedDictationPerformance(
+            route: .normal,
+            pipelineStartedAt: startedAt,
+            transcriptionDurationMilliseconds: asrMs,
+            aiProcessingDurationMilliseconds: nil,
+            fluidIntelligenceDurationMilliseconds: nil,
+            outcome: "empty"
+        )
     }
 
     private func hideOverlayAfterOutput() {

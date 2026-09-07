@@ -14,6 +14,11 @@ enum AnalyticsDatabaseError: Error {
 
 /// SQLite aggregates and crash-safe upload outbox.
 final class AnalyticsDatabase {
+    private static let performanceBucketUpperBounds = [
+        25, 50, 75, 100, 150, 200, 300, 500, 750, 1000,
+        1500, 2000, 3000, 5000, 7500, 10_000, 20_000, 60_000,
+    ]
+
     private let connection: OpaquePointer
     private let distinctID: String
     private let appVersion: String
@@ -116,6 +121,35 @@ final class AnalyticsDatabase {
         try self.transaction {
             try self.upsertDailyModelUsage(day: self.dayString(date), role: role, mode: mode, descriptor: descriptor)
             try self.enqueueActivityIfNeeded(.coreAction, at: date)
+        }
+    }
+
+    func recordDictationPerformance(
+        asrMilliseconds: Int?,
+        fluidIntelligenceMilliseconds: Int?,
+        measuredAppVersion: String,
+        at date: Date
+    ) throws {
+        guard asrMilliseconds != nil || fluidIntelligenceMilliseconds != nil else { return }
+        try self.finalizeDays(before: date)
+        let day = self.dayString(date)
+        try self.transaction {
+            if let asrMilliseconds {
+                try self.upsertPerformanceMetric(
+                    day: day,
+                    measuredAppVersion: measuredAppVersion,
+                    metric: "asr",
+                    milliseconds: asrMilliseconds
+                )
+            }
+            if let fluidIntelligenceMilliseconds {
+                try self.upsertPerformanceMetric(
+                    day: day,
+                    measuredAppVersion: measuredAppVersion,
+                    metric: "fluid_intelligence",
+                    milliseconds: fluidIntelligenceMilliseconds
+                )
+            }
         }
     }
 
@@ -370,8 +404,14 @@ final class AnalyticsDatabase {
                 "WHERE day < ? ORDER BY day, role, mode, provider, model",
             bindings: [.text(today)]
         )
+        let performanceRows = try self.query(
+            "SELECT day, measured_app_version, measured_os_version, metric, bucket_index, sample_count " +
+                "FROM daily_dictation_performance WHERE day < ? " +
+                "ORDER BY day, measured_app_version, measured_os_version, metric, bucket_index",
+            bindings: [.text(today)]
+        )
 
-        guard !usageRows.isEmpty || !modelRows.isEmpty else { return }
+        guard !usageRows.isEmpty || !modelRows.isEmpty || !performanceRows.isEmpty else { return }
         try self.transaction {
             for row in usageRows where row.count == 5 {
                 try self.enqueue(.usageDailySummary, at: date, properties: [
@@ -392,8 +432,12 @@ final class AnalyticsDatabase {
                     "use_count": Int(row[5]) ?? 0,
                 ])
             }
+            for summary in self.performanceSummaries(from: performanceRows) {
+                try self.enqueue(.dictationPerformanceDailySummary, at: date, properties: summary.properties)
+            }
             try self.run("DELETE FROM daily_usage WHERE day < ?", bindings: [.text(today)])
             try self.run("DELETE FROM daily_model_usage WHERE day < ?", bindings: [.text(today)])
+            try self.run("DELETE FROM daily_dictation_performance WHERE day < ?", bindings: [.text(today)])
         }
     }
 
@@ -473,6 +517,7 @@ final class AnalyticsDatabase {
             try self.execute("DELETE FROM outbox")
             try self.execute("DELETE FROM daily_usage")
             try self.execute("DELETE FROM daily_model_usage")
+            try self.execute("DELETE FROM daily_dictation_performance")
             try self.execute("DELETE FROM event_dedupe")
             try self.execute("DELETE FROM onboarding_flows")
             try self.execute("DELETE FROM onboarding_tryout_state")
@@ -485,8 +530,11 @@ final class AnalyticsDatabase {
     func purgeDetailedAnalytics() throws {
         try self.transaction {
             try self.run(
-                "DELETE FROM outbox WHERE event_name != ?",
-                bindings: [.text(AnalyticsEvent.activeUser.rawValue)]
+                "DELETE FROM outbox WHERE event_name != ? AND event_name != ?",
+                bindings: [
+                    .text(AnalyticsEvent.activeUser.rawValue),
+                    .text(AnalyticsEvent.dictationPerformanceDailySummary.rawValue),
+                ]
             )
             try self.execute("DELETE FROM daily_usage")
             try self.execute("DELETE FROM daily_model_usage")
@@ -526,6 +574,15 @@ final class AnalyticsDatabase {
             model TEXT NOT NULL,
             use_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(day, role, mode, provider, model)
+        );
+        CREATE TABLE IF NOT EXISTS daily_dictation_performance (
+            day TEXT NOT NULL,
+            measured_app_version TEXT NOT NULL,
+            measured_os_version TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            bucket_index INTEGER NOT NULL,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(day, measured_app_version, measured_os_version, metric, bucket_index)
         );
         CREATE TABLE IF NOT EXISTS event_dedupe (
             dedupe_key TEXT PRIMARY KEY,
@@ -625,6 +682,123 @@ final class AnalyticsDatabase {
                 .text(descriptor.provider), .text(descriptor.model),
             ]
         )
+    }
+
+    private func upsertPerformanceMetric(
+        day: String,
+        measuredAppVersion: String,
+        metric: String,
+        milliseconds: Int
+    ) throws {
+        let boundedMilliseconds = min(max(milliseconds, 0), 600_000)
+        let bucketIndex = Self.performanceBucketUpperBounds.firstIndex { boundedMilliseconds <= $0 }
+            ?? Self.performanceBucketUpperBounds.count
+        try self.run(
+            "INSERT INTO daily_dictation_performance " +
+                "(day, measured_app_version, measured_os_version, metric, bucket_index, sample_count) " +
+                "VALUES (?, ?, ?, ?, ?, 1) " +
+                "ON CONFLICT(day, measured_app_version, measured_os_version, metric, bucket_index) " +
+                "DO UPDATE SET sample_count = sample_count + 1",
+            bindings: [
+                .text(day), .text(measuredAppVersion), .text(self.systemConfiguration.osVersion),
+                .text(metric), .integer(bucketIndex),
+            ]
+        )
+    }
+
+    private struct PerformanceSummaryKey: Hashable {
+        let day: String
+        let measuredAppVersion: String
+        let measuredOSVersion: String
+    }
+
+    private struct PerformanceMetricSummary {
+        var bucketCounts = Array(repeating: 0, count: performanceBucketUpperBounds.count + 1)
+        var sampleCount = 0
+    }
+
+    private struct PerformanceSummary {
+        let key: PerformanceSummaryKey
+        var asr = PerformanceMetricSummary()
+        var fluidIntelligence = PerformanceMetricSummary()
+
+        var properties: [String: Any] {
+            var properties: [String: Any] = [
+                "performance_date": self.key.day,
+                "measured_app_version": self.key.measuredAppVersion,
+                "measured_os_version": self.key.measuredOSVersion,
+                "histogram_schema_version": 1,
+            ]
+            Self.add(self.asr, prefix: "asr", to: &properties)
+            Self.add(self.fluidIntelligence, prefix: "fluid_intelligence", to: &properties)
+            return properties
+        }
+
+        private static func add(
+            _ metric: PerformanceMetricSummary,
+            prefix: String,
+            to properties: inout [String: Any]
+        ) {
+            properties["\(prefix)_sample_count"] = metric.sampleCount
+            guard metric.sampleCount > 0 else { return }
+            properties["\(prefix)_p50_bucket"] = self.quantileBucket(metric.bucketCounts, percentile: 0.50)
+            properties["\(prefix)_p95_bucket"] = self.quantileBucket(metric.bucketCounts, percentile: 0.95)
+        }
+
+        private static func quantileBucket(_ counts: [Int], percentile: Double) -> String {
+            let target = max(1, Int(ceil(Double(counts.reduce(0, +)) * percentile)))
+            var cumulative = 0
+            for (index, count) in counts.enumerated() {
+                cumulative += count
+                if cumulative >= target {
+                    guard index < performanceBucketUpperBounds.count else { return "60000_plus" }
+                    return String(performanceBucketUpperBounds[index])
+                }
+            }
+            return "unknown"
+        }
+    }
+
+    private func performanceSummaries(from rows: [[String]]) -> [PerformanceSummary] {
+        var summaries: [PerformanceSummaryKey: PerformanceSummary] = [:]
+        for row in rows where row.count == 6 {
+            let key = PerformanceSummaryKey(
+                day: row[0],
+                measuredAppVersion: row[1],
+                measuredOSVersion: row[2]
+            )
+            var summary = summaries[key] ?? PerformanceSummary(key: key)
+            let bucketIndex = Int(row[4]) ?? -1
+            let sampleCount = Int(row[5]) ?? 0
+            if row[3] == "asr" {
+                Self.mergePerformanceRow(
+                    into: &summary.asr,
+                    bucketIndex: bucketIndex,
+                    sampleCount: sampleCount
+                )
+            } else if row[3] == "fluid_intelligence" {
+                Self.mergePerformanceRow(
+                    into: &summary.fluidIntelligence,
+                    bucketIndex: bucketIndex,
+                    sampleCount: sampleCount
+                )
+            }
+            summaries[key] = summary
+        }
+        return summaries.values.sorted {
+            ($0.key.day, $0.key.measuredAppVersion, $0.key.measuredOSVersion) <
+                ($1.key.day, $1.key.measuredAppVersion, $1.key.measuredOSVersion)
+        }
+    }
+
+    private static func mergePerformanceRow(
+        into metric: inout PerformanceMetricSummary,
+        bucketIndex: Int,
+        sampleCount: Int
+    ) {
+        guard metric.bucketCounts.indices.contains(bucketIndex) else { return }
+        metric.bucketCounts[bucketIndex] += sampleCount
+        metric.sampleCount += sampleCount
     }
 
     private func activeOnboardingFlow(origin: AnalyticsOnboardingOrigin, at date: Date) throws -> String {

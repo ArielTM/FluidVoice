@@ -12,6 +12,41 @@ enum AnalyticsEvent: String {
     case onboardingTryoutFinished = "onboarding_tryout_finished"
     case modelDownloadStarted = "model_download_started"
     case modelDownloadFinished = "model_download_finished"
+    case dictationPerformanceDailySummary = "dictation_performance_daily_summary"
+}
+
+enum AnalyticsBuildPolicy {
+    static func automaticallyCollectsDictationPerformance(appVersion: String) -> Bool {
+        appVersion
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .contains("beta")
+    }
+}
+
+enum DictationPerformanceLogSummary {
+    static func line(
+        asrMilliseconds: Int?,
+        aiMilliseconds: Int?,
+        readyMilliseconds: Int,
+        outcome: String
+    ) -> String {
+        let asr = asrMilliseconds ?? -1
+        let ai = aiMilliseconds ?? -1
+        let measured = max(asr, 0) + max(ai, 0)
+        let appOverhead = max(readyMilliseconds - measured, 0)
+        let slowest: String
+        if ai >= asr, ai >= appOverhead, ai >= 0 {
+            slowest = "ai"
+        } else if asr >= appOverhead, asr >= 0 {
+            slowest = "asr"
+        } else {
+            slowest = "app_overhead"
+        }
+        return "DICTATION_SUMMARY asrMs=\(asr) aiMs=\(ai) "
+            + "appOverheadMs=\(appOverhead) readyMs=\(readyMilliseconds) "
+            + "slowest=\(slowest) outcome=\(outcome)"
+    }
 }
 
 enum AnalyticsActivityKind: String {
