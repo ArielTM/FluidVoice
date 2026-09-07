@@ -210,6 +210,8 @@ def summarize(run):
         outcome = "cancelled"
     elif summary:
         outcome = summary["fields"].get("outcome", "finished")
+    elif ready_summary and ready_summary["fields"].get("outcome") == "asr_failed":
+        outcome = "asr_failed"
     elif final and final["fields"].get("textChars") == "0" and phases["handler_return"] is not None:
         outcome = "empty"
     elif phases["paste_done"] is not None:

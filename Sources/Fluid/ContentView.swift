@@ -3179,7 +3179,7 @@ struct ContentView: View {
             transcriptionDurationMilliseconds: asrMs,
             aiProcessingDurationMilliseconds: nil,
             fluidIntelligenceDurationMilliseconds: nil,
-            outcome: "empty"
+            outcome: self.asr.lastStopOutcome == .failed ? "asr_failed" : "empty"
         )
     }
 

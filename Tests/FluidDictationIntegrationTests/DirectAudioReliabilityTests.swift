@@ -173,6 +173,95 @@ final class DirectAudioReliabilityTests: XCTestCase {
     }
 
     @MainActor
+    func testDelayedFinalStatusCannotChangeANewerRecording() async {
+        var currentSession = 7
+        let stoppingSession = currentSession
+        var overlay = "Recording"
+        let staleTask = scheduleDeferredMainActorOperation(
+            afterNanoseconds: 0,
+            shouldRun: { currentSession == stoppingSession }
+        ) { overlay = "Transcribing" }
+        currentSession = 8
+        await staleTask.value
+        XCTAssertEqual(overlay, "Recording")
+
+        let currentTask = scheduleDeferredMainActorOperation(
+            afterNanoseconds: 0,
+            shouldRun: { currentSession == 8 }
+        ) { overlay = "Transcribing" }
+        await currentTask.value
+        XCTAssertEqual(overlay, "Transcribing")
+    }
+
+    @MainActor
+    func testStalledStreamingDrainIsBoundedWithoutCancellingProvider() async {
+        let lifecycle = StreamingTaskLifecycle()
+        var providerContinuation: CheckedContinuation<Void, Never>?
+        var providerWasCancelled = false
+        var completions = 0
+        lifecycle.schedule(sessionID: 7, delayNanoseconds: 0) { _ in
+            await withCheckedContinuation { providerContinuation = $0 }
+            providerWasCancelled = Task.isCancelled
+        } completion: { _ in completions += 1 }
+        while providerContinuation == nil {
+            await Task.yield()
+        }
+
+        let completed = await lifecycle.drain(sessionID: 7, timeoutNanoseconds: 1_000_000)
+        XCTAssertFalse(completed)
+        XCTAssertTrue(lifecycle.hasActiveWork, "Timeout must retain the provider and its incremental state")
+        XCTAssertEqual(lifecycle.pendingDrainCount, 0, "Timed-out waiters must be removed")
+        XCTAssertEqual(completions, 0)
+        XCTAssertFalse(lifecycle.schedule(sessionID: 8, delayNanoseconds: 0) { _ in
+            XCTFail("A replacement must not race the stalled provider")
+        } completion: { _ in })
+
+        let resumedDrain = Task { @MainActor in
+            await lifecycle.drain(sessionID: 7, timeoutNanoseconds: 60_000_000_000)
+        }
+        await Task.yield()
+        providerContinuation?.resume()
+        let recovered = await resumedDrain.value
+        XCTAssertTrue(recovered)
+        XCTAssertFalse(providerWasCancelled)
+        XCTAssertEqual(completions, 1)
+        XCTAssertFalse(lifecycle.hasActiveWork)
+        XCTAssertEqual(lifecycle.pendingDrainCount, 0, "Completion must retire its timer/waiter")
+    }
+
+    @MainActor
+    func testTimedOutHandoffWakesStartsButKeepsBufferOwnedUntilRecovery() async throws {
+        let gate = RecordingBufferHandoffGate()
+        let token = try XCTUnwrap(gate.begin())
+        var wokeInRecovery = false
+        let waitingStart = Task { @MainActor in
+            await gate.waitUntilAvailable()
+            wokeInRecovery = gate.isRecovering
+        }
+        while gate.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+        gate.markTimedOut(token)
+        await waitingStart.value
+        XCTAssertTrue(wokeInRecovery)
+        XCTAssertTrue(gate.isActive)
+        XCTAssertNil(gate.begin(), "Timeout must not release the PCM to another capture")
+        XCTAssertEqual(gate.pendingWaiterCount, 0)
+
+        let otherGate = RecordingBufferHandoffGate()
+        let staleToken = try XCTUnwrap(otherGate.begin())
+        gate.complete(staleToken)
+        XCTAssertTrue(gate.isRecovering)
+        gate.complete(token)
+        XCTAssertFalse(gate.isRecovering)
+        XCTAssertFalse(gate.isActive)
+        let nextToken = try XCTUnwrap(gate.begin())
+        gate.markTimedOut(token)
+        XCTAssertFalse(gate.isRecovering, "An old timeout cannot affect a fresh recording")
+        gate.complete(nextToken)
+    }
+
+    @MainActor
     func testStreamingIdleSchedulerCancelsWithoutLaunchingOrActiveDrain() async {
         let lifecycle = StreamingTaskLifecycle()
         var operationStarted = false
@@ -228,9 +317,7 @@ final class DirectAudioReliabilityTests: XCTestCase {
         XCTAssertFalse(lifecycle.cancelScheduler())
 
         let drainTask = Task { @MainActor in
-            guard let activeTask = lifecycle.activeTaskToDrain(sessionID: 11) else { return false }
-            _ = await activeTask.result
-            return true
+            await lifecycle.drain(sessionID: 11, timeoutNanoseconds: 60_000_000_000)
         }
         await Task.yield()
         XCTAssertEqual(completionCount, 0)

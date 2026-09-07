@@ -223,6 +223,16 @@ class DictationLogSummaryTests(unittest.TestCase):
                 self.assertEqual(result["outcome"], outcome)
                 self.assertEqual(result["metrics"]["stop_to_delivery_ms"], 100)
 
+    def test_asr_timeout_failure_is_not_empty_or_success(self):
+        result = self.parse(
+            row("APP_BENCH", 1, "pipeline_begin id=A pipelineID=A"),
+            "pipelineID=A DICTATION_SUMMARY asrMs=-1 aiMs=-1 readyMs=30000 outcome=asr_failed",
+            "pipelineID=A APP_BENCH t=31 pipeline_handler_return id=A",
+        )[0]
+        self.assertEqual(result["outcome"], "asr_failed")
+        self.assertIsNone(result["metrics"]["summary_asr_ms"])
+        self.assertIsNone(result["metrics"]["stop_to_delivery_ms"])
+
     def test_restart_does_not_deduplicate_a_new_recording_with_reused_values(self):
         begin = row("APP_BENCH", 1, "begin_recording")
         results = self.parse(begin, "[RUN] new process", begin)
