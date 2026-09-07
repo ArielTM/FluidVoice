@@ -2912,6 +2912,9 @@ final class ASRService: ObservableObject {
             if self.isAsrReady, provider.isReady {
                 self.benchmarkLog("stop_ensure_ready skipped=true elapsedMs=0")
             } else {
+                // TODO: Investigate rapid restart while this cold-provider stop is pending (PR #950).
+                // A new recording may replace output context still read by the previous transcript.
+                // Not reproduced in-app; defer changes for now and preserve responsive restarts.
                 self.publishStoppedState(for: stoppingSessionID)
                 DebugLogger.shared.debug("🔍 Calling ensureAsrReady()...", source: "ASRService")
                 try await self.ensureAsrReady()
