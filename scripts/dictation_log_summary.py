@@ -8,13 +8,14 @@ No recording, playback, app activation, or file writes are performed.
 
 import argparse
 import json
+import math
 import re
 import statistics
 from pathlib import Path
 
 
 MARKER = re.compile(
-    r"\b(APP_BENCH|ASR_BENCH|FI_SERVICE_BENCH|FI_BRIDGE_BENCH|LLM_BENCH|OVERLAY_BENCH|TYPING_BENCH|HISTORY_BENCH|PIPELINE_SUMMARY)\b(.*)"
+    r"\b(APP_BENCH|ASR_BENCH|FI_SERVICE_BENCH|FI_BRIDGE_BENCH|LLM_BENCH|OVERLAY_BENCH|TYPING_BENCH|HISTORY_BENCH|PIPELINE_SUMMARY|DICTATION_SUMMARY)\b(.*)"
 )
 FIELD = re.compile(r"(?:^|\s)(\w+)=([^\s]+)")
 WALL = re.compile(r"^\[([\d:.]+)\]")
@@ -30,12 +31,13 @@ def parse_logs(lines):
     """
     runs, by_id, current, seen = [], {}, None, set()
     for line in lines:
+        if line.startswith("[RUN]"):
+            current, by_id = None, {}
+            seen.clear()
+            continue
         if line in seen:
             continue  # overlapping rotated snapshots
         seen.add(line)
-        if line.startswith("[RUN]"):
-            current, by_id = None, {}
-            continue
         match = MARKER.search(line)
         private_result = "Private provider post-processing complete" in line
         if not match and not private_result:
@@ -47,15 +49,17 @@ def parse_logs(lines):
         else:
             family, body = match.groups()
         fields = dict(FIELD.findall(body))
+        correlation = dict(FIELD.findall(line)).get("pipelineID")
         words = [part for part in body.split() if "=" not in part]
         name = "complete" if family == "FI_RESULT" else (
-            " ".join(words) if family != "PIPELINE_SUMMARY" else "summary"
+            " ".join(words) if family not in ("PIPELINE_SUMMARY", "DICTATION_SUMMARY") else "summary"
         )
         try:
             timestamp = float(fields["t"])
         except (KeyError, ValueError):
             timestamp = None
         event = {"family": family, "name": name, "t": timestamp,
+                 "pipeline_id": correlation,
                  "fields": {k: v for k, v in fields.items() if k != "t"}}
         if family == "APP_BENCH" and name == "begin_recording":
             wall = WALL.match(line)
@@ -68,9 +72,18 @@ def parse_logs(lines):
                            "events": [], "cancelled": False, "partial_start": True}
                 runs.append(current)
             current["id"] = fields.get("id")
+            current["correlated"] = correlation is not None
             if current["id"]:
                 by_id[current["id"]] = current
-        target = by_id.get(fields.get("id"), current)
+        explicit_id = correlation or (fields.get("id") if family in (
+            "APP_BENCH", "PIPELINE_SUMMARY", "LLM_BENCH") else None)
+        if correlation and family in ("APP_BENCH", "PIPELINE_SUMMARY", "LLM_BENCH") and fields.get("id", correlation) != correlation:
+            continue
+        target = by_id.get(explicit_id) if explicit_id else current
+        if target and target.get("correlated") and not explicit_id:
+            # Unscoped work may belong to Local API or a previous recording.
+            # Never use proximity as identity for modern stop-pipeline logs.
+            continue
         if family == "FI_RESULT":
             # This provider log has no pipeline ID. Attach it only while the
             # current recording has an AI call that has not returned, so an
@@ -78,7 +91,7 @@ def parse_logs(lines):
             ai_names = [event["name"] for event in target["events"]] if target else []
             last_call = max((index for index, name in enumerate(ai_names) if name == "ai_process_call"), default=-1)
             last_return = max((index for index, name in enumerate(ai_names) if name == "ai_process_return"), default=-1)
-            if last_call <= last_return:
+            if not explicit_id and last_call <= last_return:
                 continue
         # An unknown callback ID must not contaminate a newer recording.
         if fields.get("id") and family in ("APP_BENCH", "PIPELINE_SUMMARY") and name != "pipeline_begin":
@@ -112,8 +125,9 @@ def summarize(run):
 
     def numeric_field(event, key):
         try:
-            return float(event["fields"][key]) if event else None
-        except (KeyError, ValueError):
+            value = float(event["fields"][key]) if event else None
+            return value if value is not None and math.isfinite(value) and value >= 0 else None
+        except (KeyError, ValueError, TypeError):
             return None
 
     def delta(end, start):
@@ -160,9 +174,13 @@ def summarize(run):
         "llm_response_decoded": time(find("LLM_BENCH", {"response_decoded"}, after)),
         "llm_call_return": time(find("LLM_BENCH", {"call_return"}, after)),
         "ai_return": time(find("APP_BENCH", {"ai_process_return"}, after)),
+        "ai_failure": time(find("APP_BENCH", {"ai_process_fail"}, after)),
         "text_ready": time(find("APP_BENCH", {"text_ready"}, after)),
         "paste_dispatch": time(find("TYPING_BENCH", {"asr_type_dispatched"}, after)),
         "paste_done": time(find("TYPING_BENCH", {"complete"}, after)),
+        "injection_return": time(find("TYPING_BENCH", {"insert_return"}, after)),
+        "typing_request": time(find("TYPING_BENCH", {"request"}, after)),
+        "typing_worker": time(find("TYPING_BENCH", {"worker_start"}, after)),
         "hide_request": time(find("OVERLAY_BENCH", {"manager finish_hide_request"}, after)),
         "alpha_return": time(find("OVERLAY_BENCH", {"bottom_hide_alpha_return"}, after)),
         "order_out_return": time(find("OVERLAY_BENCH", {"bottom_hide_order_out_return"}, after)),
@@ -183,10 +201,11 @@ def summarize(run):
     # FI completion logs do not carry a pipeline ID. If another local request
     # finishes during this dictation, suppress the breakdown instead of
     # guessing which result belongs to the hotkey pipeline.
-    private_result = private_results[0] if len(private_results) == 1 else None
+    private_result = private_results[0] if len(private_results) == 1 and private_results[0]["pipeline_id"] else None
     final_request = find("ASR_BENCH", {"final_executor_request"}, after)
     ai_call = find("APP_BENCH", {"ai_process_call"}, after)
     summary = find("PIPELINE_SUMMARY", {"summary"}, after)
+    ready_summary = find_untimed("DICTATION_SUMMARY", {"summary"}, stop_event_index)
     if run["cancelled"]:
         outcome = "cancelled"
     elif summary:
@@ -209,7 +228,8 @@ def summarize(run):
     fi_ttft_ms = numeric_field(private_result, "ttftMs")
     fi_decode_ms = numeric_field(private_result, "decodeMs")
     fi_return_ms = numeric_field(private_result, "returnMs")
-    ai_processing_ms = delta(phases["ai_return"], phases["ai_call"])
+    ai_processing_ms = delta(phases["ai_return"] if phases["ai_return"] is not None
+                             else phases["ai_failure"], phases["ai_call"])
     ai_route_ms = delta(phases["ai_route_resolved"], phases["ai_call"])
     fi_known_ms = [value for value in (fi_setup_ms, fi_request_ms, fi_return_ms) if value is not None]
     fi_remaining_handoff_ms = (
@@ -252,6 +272,9 @@ def summarize(run):
         "fi_prefill_ms": fi_prefill_ms,
         "fi_ttft_ms": fi_ttft_ms,
         "fi_decode_ms": fi_decode_ms,
+        "fi_prompt_tokens": numeric_field(private_result, "promptTokens"),
+        "fi_output_tokens": numeric_field(private_result, "outputTokens"),
+        "fi_tokens_per_second": numeric_field(private_result, "tps"),
         "fi_return_ms": fi_return_ms,
         "fi_remaining_handoff_ms": fi_remaining_handoff_ms,
         "llm_setup_ms": delta(phases["llm_call_enter"], phases["ai_route_resolved"]),
@@ -273,19 +296,32 @@ def summarize(run):
         "ai_processing_ms": ai_processing_ms,
         "ai_to_ready_ms": delta(phases["text_ready"], phases["ai_return"]),
         "internal_stop_to_ready_ms": delta(phases["text_ready"], stop),
+        "typing_queue_ms": delta(phases["typing_worker"], phases["typing_request"]),
+        "ready_to_injection_ms": delta(phases["injection_return"], phases["text_ready"]),
+        "ready_to_delivery_ms": delta(phases["delivery_callback"], phases["text_ready"]),
+        "stop_to_delivery_ms": numeric_field(summary, "totalMs"),
+        "summary_asr_ms": numeric_field(ready_summary, "asrMs"),
+        "summary_ai_ms": numeric_field(ready_summary, "aiMs"),
+        "summary_app_overhead_ms": numeric_field(ready_summary, "appOverheadMs"),
+        "summary_ready_ms": numeric_field(ready_summary, "readyMs"),
     }
     context = {
-        "audio_ms": float(final["fields"]["audioMs"]) if final and final["fields"].get("audioMs") else None,
-        "samples": int(final["fields"]["samples"]) if final and final["fields"].get("samples") else None,
-        "text_chars": int(final["fields"]["textChars"]) if final and final["fields"].get("textChars") else None,
+        "route": next((e["fields"].get("route") for e in events
+                       if e["family"] == "APP_BENCH" and e["name"] == "pipeline_begin"), None),
+        "llm_attempt_count": sum(e["family"] == "LLM_BENCH" and e["name"] == "attempt_start" for e in events),
+        "audio_ms": numeric_field(final, "audioMs"),
+        "samples": numeric_field(final, "samples"),
+        "text_chars": numeric_field(final, "textChars"),
         "asr_model": final_request["fields"].get("model") if final_request else None,
         "vocab_enabled": final_request["fields"].get("vocabEnabled") if final_request else None,
-        "vocab_terms": int(final_request["fields"]["vocabTerms"])
-        if final_request and final_request["fields"].get("vocabTerms") else None,
+        "vocab_terms": numeric_field(final_request, "vocabTerms"),
         "ai_provider": ai_call["fields"].get("provider") if ai_call else None,
         "ai_model": ai_call["fields"].get("model") if ai_call else None,
     }
     return {"id": run["id"], "time": run["time"], "outcome": outcome,
+            "ready_outcome": ready_summary["fields"].get("outcome") if ready_summary else None,
+            "correlation": "request_id" if run.get("correlated") else "legacy_proximity_uncertain",
+            "correctness": "not_checked_requires_expected_and_delivered_text",
             "partial_start": run["partial_start"], "stop_uptime": stop,
             "from_stop_ms": {key: delta(value, stop) for key, value in phases.items()},
             "metrics": metrics, "context": context, "events": events}
@@ -295,9 +331,22 @@ def render(rows, details=False):
     def fmt(value):
         return "—" if value is None else f"{value:.1f}"
 
-    lines = ["# Recent dictations", "",
+    lines = ["# Dictation evaluation", "",
+             "Readiness is not delivery. Timing is not text-correctness proof.", "",
+             "| Time / ID | Correlation | Ready result | Delivery result | ASR | AI | App overhead | Ready | Delivery |",
+             "|---|---|---|---|---:|---:|---:|---:|---:|"]
+    for row in rows:
+        m = row["metrics"]
+        values = [m["summary_asr_ms"], m["summary_ai_ms"], m["summary_app_overhead_ms"],
+                  m["summary_ready_ms"], m["stop_to_delivery_ms"]]
+        lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | {row['correlation']} | "
+                     f"{row['ready_outcome'] or 'unknown'} | {row['outcome']} | "
+                     + " | ".join(map(fmt, values)) + " |")
+    lines += ["", "Legacy proximity metrics are exploratory, not authoritative overlap comparisons. "
+              "FI breakdown requires a matching request ID. Correctness requires checking the actual delivered text.",
+              "", "## Delivery and overlay", "",
              "Times in ms from stop-handler entry (not physical key-down). — = not logged / not applicable.",
-             "Hidden = window API returned, not measured pixels. Paste = injection completed, not target-app rendering.", "",
+             "Hidden = window API returned, not measured pixels. Paste = worker completed (including optional send-key wait), not target-app rendering.", "",
              "| Time / ID | Outcome | ASR | Ready | Paste | Hidden | Hide cost | Hidden − paste | Callback queue | Cleanup |",
              "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for row in rows:
@@ -345,7 +394,7 @@ def render(rows, details=False):
                       m["ai_bridge_request_ms"], m["ai_runtime_to_adapter_ms"],
                       m["ai_adapter_to_service_ms"], m["ai_service_to_app_ms"]]
             lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | " + " | ".join(map(fmt, values)) + " |")
-    if any(row["metrics"]["fi_request_ms"] is not None for row in rows):
+    if any(row["metrics"]["fi_model_ms"] is not None for row in rows):
         lines += ["", "## Private FI handoff", "",
                   "| Time / ID | Setup | Request | Model | Prefill | TTFT | Decode | Inside return | Remaining handoff | AI total |",
                   "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]

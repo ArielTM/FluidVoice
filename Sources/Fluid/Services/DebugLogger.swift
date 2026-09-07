@@ -3,6 +3,10 @@ import Foundation
 final nonisolated class DebugLogger: @unchecked Sendable {
     static let shared = DebugLogger()
 
+    /// Request-local correlation survives actor hops without mutable global state.
+    /// Capture explicitly before handing work to a DispatchQueue or detached task.
+    @TaskLocal static var pipelineID: String?
+
     private let queue = DispatchQueue(label: "debug.logger", qos: .utility)
 
     private static let logFormatter: DateFormatter = {
@@ -23,8 +27,9 @@ final nonisolated class DebugLogger: @unchecked Sendable {
     private init() {}
 
     func log(_ message: String, level: LogLevel = .info, source: String = "App") {
+        let pipelineID = Self.pipelineID
         self.queue.async {
-            self.write(message, level: level, source: source)
+            self.write(message, level: level, source: source, pipelineID: pipelineID)
         }
     }
 
@@ -35,18 +40,20 @@ final nonisolated class DebugLogger: @unchecked Sendable {
         source: String = "App",
         _ message: @escaping @Sendable () -> String
     ) {
+        let pipelineID = Self.pipelineID
         self.queue.async {
-            self.write(message(), level: level, source: source)
+            self.write(message(), level: level, source: source, pipelineID: pipelineID)
         }
     }
 
-    private func write(_ message: String, level: LogLevel, source: String) {
+    private func write(_ message: String, level: LogLevel, source: String, pipelineID: String?) {
         let timestampString = Self.logFormatter.string(from: Date())
         let formattedLine = self.formatLogLine(
             timestamp: timestampString,
             level: level,
             source: source,
-            message: message
+            message: message,
+            pipelineID: pipelineID
         )
 
         // Always persist diagnostics so issues can be debugged even if UI debug mode is off.
@@ -54,8 +61,9 @@ final nonisolated class DebugLogger: @unchecked Sendable {
         print(formattedLine)
     }
 
-    private func formatLogLine(timestamp: String, level: LogLevel, source: String, message: String) -> String {
-        "[\(timestamp)] [\(level.rawValue)] [\(source)] \(message)"
+    private func formatLogLine(timestamp: String, level: LogLevel, source: String, message: String, pipelineID: String?) -> String {
+        let correlation = pipelineID.map { "pipelineID=\($0) " } ?? ""
+        return "[\(timestamp)] [\(level.rawValue)] [\(source)] \(correlation)\(message)"
     }
 }
 

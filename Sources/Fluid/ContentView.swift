@@ -2552,8 +2552,14 @@ struct ContentView: View {
     // MARK: - Stop and Process Transcription
 
     private func stopAndProcessTranscription(route: DictationOutputRoute = .normal) async {
-        let pipelineStartedAt = ProcessInfo.processInfo.systemUptime
         let pipelineID = UUID().uuidString
+        await DebugLogger.$pipelineID.withValue(pipelineID) {
+            await self.processStoppedTranscription(route: route, pipelineID: pipelineID)
+        }
+    }
+
+    private func processStoppedTranscription(route: DictationOutputRoute, pipelineID: String) async {
+        let pipelineStartedAt = ProcessInfo.processInfo.systemUptime
         let expectedOverlayLifecycleID = self.overlayLifecycleID
         self.appBench("pipeline_begin id=\(pipelineID) route=\(route.rawValue)")
         defer {
@@ -2637,45 +2643,7 @@ struct ContentView: View {
 
         // Prompt Test Mode: reroute dictation hotkey output into the prompt editor (no typing/clipboard/history).
         if promptTest.isActive {
-            promptTest.lastTranscriptionText = transcribedText
-            promptTest.lastOutputText = ""
-            promptTest.lastError = ""
-
-            guard DictationAIPostProcessingGate.isProviderConfigured(
-                providerID: promptTest.draftProviderID,
-                model: promptTest.draftModel
-            ) else {
-                promptTest.lastError = "AI post-processing is not configured. Configure a provider/model (and API key for non-local endpoints) to test prompts."
-                self.menuBarManager.setProcessing(false)
-                return
-            }
-
-            promptTest.isProcessing = true
-            // Processing already true from above
-            defer {
-                self.menuBarManager.setProcessing(false)
-                promptTest.isProcessing = false
-            }
-
-            do {
-                let result = try await self.processTextWithAI(
-                    transcribedText,
-                    overrideSystemPrompt: promptTest.draftPromptText,
-                    overrideProviderID: promptTest.draftProviderID,
-                    overrideModel: promptTest.draftModel
-                )
-                let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
-                let literalFormattedResult = ASRService.applyDictationLiteralFormatting(
-                    result,
-                    appName: appInfo.name,
-                    bundleID: appInfo.bundleId,
-                    windowTitle: appInfo.windowTitle
-                )
-                promptTest.lastOutputText = ASRService.applyGAAVFormatting(literalFormattedResult)
-            } catch {
-                DebugLogger.shared.error("Prompt test AI call failed: \(error.localizedDescription)", source: "ContentView")
-                promptTest.lastError = error.localizedDescription
-            }
+            await self.processDictationPromptTest(transcribedText)
             return
         }
 
@@ -2774,6 +2742,7 @@ struct ContentView: View {
                 self.appBench("ai_preview_flushed id=\(pipelineID)")
             } catch {
                 refiningStatusTask.cancel()
+                self.appBench("ai_process_fail id=\(pipelineID)")
                 // Fall back to the raw transcription so the user still gets
                 // their words typed instead of an error string.
                 DebugLogger.shared.error(
@@ -2949,6 +2918,12 @@ struct ContentView: View {
                     targetPID: typingTarget.pid,
                     textReadyAt: finalTextReadyAt
                 )
+                self.logPipelineCompletion(
+                    outcome: String(describing: deliveryOutcome),
+                    pipelineID: pipelineID,
+                    pipelineStartedAt: pipelineStartedAt,
+                    textReadyAt: finalTextReadyAt
+                )
                 didTypeExternally = deliveryOutcome.didInsert
             } else {
                 let shouldHideOverlayAfterDelivery = !shouldShowAIProcessingFailure
@@ -3007,6 +2982,53 @@ struct ContentView: View {
 
         if !didTypeExternally, !shouldShowAIProcessingFailure, !stopOverlay.didRequestHide {
             self.hideOverlayAfterOutput()
+        }
+        if !shouldTypeExternally {
+            self.logPipelineCompletion(
+                outcome: shouldPersistOutputs ? "internal_editor" : "sandbox",
+                pipelineID: pipelineID,
+                pipelineStartedAt: pipelineStartedAt,
+                textReadyAt: finalTextReadyAt
+            )
+        }
+    }
+
+    private func processDictationPromptTest(_ transcribedText: String) async {
+        let promptTest = DictationPromptTestCoordinator.shared
+        promptTest.lastTranscriptionText = transcribedText
+        promptTest.lastOutputText = ""
+        promptTest.lastError = ""
+        guard DictationAIPostProcessingGate.isProviderConfigured(
+            providerID: promptTest.draftProviderID,
+            model: promptTest.draftModel
+        ) else {
+            promptTest.lastError = "AI post-processing is not configured. Configure a provider/model (and API key for non-local endpoints) to test prompts."
+            self.menuBarManager.setProcessing(false)
+            return
+        }
+        promptTest.isProcessing = true
+        defer {
+            self.menuBarManager.setProcessing(false)
+            promptTest.isProcessing = false
+        }
+        do {
+            let result = try await self.processTextWithAI(
+                transcribedText,
+                overrideSystemPrompt: promptTest.draftPromptText,
+                overrideProviderID: promptTest.draftProviderID,
+                overrideModel: promptTest.draftModel
+            )
+            let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
+            let literalFormattedResult = ASRService.applyDictationLiteralFormatting(
+                result,
+                appName: appInfo.name,
+                bundleID: appInfo.bundleId,
+                windowTitle: appInfo.windowTitle
+            )
+            promptTest.lastOutputText = ASRService.applyGAAVFormatting(literalFormattedResult)
+        } catch {
+            DebugLogger.shared.error("Prompt test AI call failed: \(error.localizedDescription)", source: "ContentView")
+            promptTest.lastError = error.localizedDescription
         }
     }
 
@@ -3090,12 +3112,11 @@ struct ContentView: View {
         shouldHideOverlay: Bool,
         expectedOverlayLifecycleID: UInt64
     ) {
-        let finishedAt = ProcessInfo.processInfo.systemUptime
-        DebugLogger.shared.info(
-            "PIPELINE_SUMMARY id=\(pipelineID) t=\(finishedAt) " +
-                "stopToReadyMs=\((textReadyAt - pipelineStartedAt) * 1000) readyToDeliveryMs=\((finishedAt - textReadyAt) * 1000) " +
-                "totalMs=\((finishedAt - pipelineStartedAt) * 1000) outcome=\(outcome)",
-            source: "AppBenchmark"
+        self.logPipelineCompletion(
+            outcome: String(describing: outcome),
+            pipelineID: pipelineID,
+            pipelineStartedAt: pipelineStartedAt,
+            textReadyAt: textReadyAt
         )
         guard shouldHideOverlay else { return }
         guard self.overlayLifecycleID == expectedOverlayLifecycleID else {
@@ -3108,6 +3129,21 @@ struct ContentView: View {
         // Ordinary dictation already hid in the dispatch turn and returns above.
         self.appBench("overlay_hide_request reason=delivery_complete outcome=\(outcome)")
         self.menuBarManager.beginProcessingCompletionAndHideOverlay()
+    }
+
+    private func logPipelineCompletion(
+        outcome: String,
+        pipelineID: String,
+        pipelineStartedAt: TimeInterval,
+        textReadyAt: TimeInterval
+    ) {
+        let finishedAt = ProcessInfo.processInfo.systemUptime
+        DebugLogger.shared.info(
+            "PIPELINE_SUMMARY id=\(pipelineID) t=\(finishedAt) " +
+                "stopToReadyMs=\((textReadyAt - pipelineStartedAt) * 1000) readyToDeliveryMs=\((finishedAt - textReadyAt) * 1000) " +
+                "totalMs=\((finishedAt - pipelineStartedAt) * 1000) outcome=\(outcome)",
+            source: "AppBenchmark"
+        )
     }
 
     private func recordCompletedDictationPerformance(

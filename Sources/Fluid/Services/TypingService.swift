@@ -427,107 +427,110 @@ final class TypingService {
         self.log("[TypingService] Accessibility check passed, proceeding with text injection")
         self.isCurrentlyTyping = true
 
+        let pipelineID = DebugLogger.pipelineID
         DispatchQueue.global(qos: .userInitiated).async {
-            var outcome: DeliveryOutcome = .insertionFailed
-            let workerStartedAt = ProcessInfo.processInfo.systemUptime
-            self.bench("worker_start queueDelayMs=\(Self.elapsedMs(from: requestedAt, to: workerStartedAt))")
+            DebugLogger.$pipelineID.withValue(pipelineID) {
+                var outcome: DeliveryOutcome = .insertionFailed
+                let workerStartedAt = ProcessInfo.processInfo.systemUptime
+                self.bench("worker_start queueDelayMs=\(Self.elapsedMs(from: requestedAt, to: workerStartedAt))")
 
-            defer {
-                let completedAt = ProcessInfo.processInfo.systemUptime
-                self.isCurrentlyTyping = false
-                self.bench(
-                    "complete totalMs=\(Self.elapsedMs(from: requestedAt, to: completedAt)) textReadyToCompleteMs=\(textReadyAt.map { String(Self.elapsedMs(from: $0, to: completedAt)) } ?? "nil")"
-                )
-                self.log("[TypingService] Typing operation completed, isCurrentlyTyping set to false")
-                let completedOutcome = outcome
-                Task { @MainActor in
+                defer {
+                    let completedAt = ProcessInfo.processInfo.systemUptime
+                    self.isCurrentlyTyping = false
                     self.bench(
-                        "delivery_main_begin queueMs=\(Self.elapsedMs(from: completedAt, to: ProcessInfo.processInfo.systemUptime))"
+                        "complete totalMs=\(Self.elapsedMs(from: requestedAt, to: completedAt)) textReadyToCompleteMs=\(textReadyAt.map { String(Self.elapsedMs(from: $0, to: completedAt)) } ?? "nil")"
                     )
-                    // Delivery UI must finish before correction tracking performs
-                    // any synchronous Accessibility queries on the main thread.
-                    completion?(completedOutcome)
-                    self.bench("delivery_main_callback_return")
-                    if tracksDictionaryCorrections,
-                       postInsertionKey == nil,
-                       completedOutcome.didInsert
-                    {
-                        AutomaticDictionaryCorrectionTracker.shared.beginObservingInsertion(
-                            text,
-                            targetPID: preferredTargetPID
+                    self.log("[TypingService] Typing operation completed, isCurrentlyTyping set to false")
+                    let completedOutcome = outcome
+                    Task { @MainActor in
+                        self.bench(
+                            "delivery_main_begin queueMs=\(Self.elapsedMs(from: completedAt, to: ProcessInfo.processInfo.systemUptime))"
                         )
-                        self.bench("dictionary_tracking_scheduled afterDeliveryCallback=true")
+                        // Delivery UI must finish before correction tracking performs
+                        // any synchronous Accessibility queries on the main thread.
+                        completion?(completedOutcome)
+                        self.bench("delivery_main_callback_return")
+                        if tracksDictionaryCorrections,
+                           postInsertionKey == nil,
+                           completedOutcome.didInsert
+                        {
+                            AutomaticDictionaryCorrectionTracker.shared.beginObservingInsertion(
+                                text,
+                                targetPID: preferredTargetPID
+                            )
+                            self.bench("dictionary_tracking_scheduled afterDeliveryCallback=true")
+                        }
                     }
                 }
-            }
 
-            self.log("[TypingService] Starting async text insertion process")
-            if settleDelayMs > 0 {
-                usleep(useconds_t(settleDelayMs * 1000))
-            }
-            self.bench("settle_delay_done delayMs=\(settleDelayMs) elapsedMs=\(Self.elapsedMs(since: requestedAt))")
-            let hasTextToInsert = !text.isEmpty
-            if postInsertionKey != nil {
+                self.log("[TypingService] Starting async text insertion process")
+                if settleDelayMs > 0 {
+                    usleep(useconds_t(settleDelayMs * 1000))
+                }
+                self.bench("settle_delay_done delayMs=\(settleDelayMs) elapsedMs=\(Self.elapsedMs(since: requestedAt))")
+                let hasTextToInsert = !text.isEmpty
+                if postInsertionKey != nil {
+                    guard let preferredTargetPID, let requiredFocusTarget else {
+                        outcome = .actionSuppressed
+                        return
+                    }
+                    // A held dictation modifier must suppress only the key action,
+                    // not the dictated text. The longer check below waits for
+                    // modifiers after insertion before deciding whether to send.
+                    guard Self.canInsertBeforePostInsertionAction(
+                        preferredTargetPID: preferredTargetPID,
+                        requiredTargetPID: requiredFocusTarget.pid,
+                        isSecureTextField: requiredFocusTarget.isSecureTextField,
+                        exactFocusIsActive: Self.isExactFocusTargetActive(requiredFocusTarget)
+                    ) else {
+                        outcome = .actionSuppressed
+                        return
+                    }
+                }
+
+                if hasTextToInsert {
+                    self.log("[TypingService] Delay completed, calling insertTextInstantly")
+                    let insertStartedAt = ProcessInfo.processInfo.systemUptime
+                    self.bench("insert_call")
+                    let inserted = self.insertTextInstantly(text, preferredTargetPID: preferredTargetPID)
+                    self.bench(
+                        "insert_return elapsedMs=\(Self.elapsedMs(since: insertStartedAt)) totalMs=\(Self.elapsedMs(since: requestedAt))"
+                    )
+                    guard inserted else {
+                        outcome = .insertionFailed
+                        return
+                    }
+
+                    outcome = .inserted
+                }
+
+                guard let postInsertionKey else { return }
                 guard let preferredTargetPID, let requiredFocusTarget else {
-                    outcome = .actionSuppressed
+                    outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
                     return
                 }
-                // A held dictation modifier must suppress only the key action,
-                // not the dictated text. The longer check below waits for
-                // modifiers after insertion before deciding whether to send.
-                guard Self.canInsertBeforePostInsertionAction(
+                let modifiersReleased = self.waitForPhysicalModifiersToRelease(timeout: 2)
+                let exactFocusIsActive = Self.isExactFocusTargetActive(requiredFocusTarget)
+                guard Self.canDispatchPostInsertionAction(
                     preferredTargetPID: preferredTargetPID,
                     requiredTargetPID: requiredFocusTarget.pid,
                     isSecureTextField: requiredFocusTarget.isSecureTextField,
-                    exactFocusIsActive: Self.isExactFocusTargetActive(requiredFocusTarget)
+                    modifiersReleased: modifiersReleased,
+                    exactFocusIsActive: exactFocusIsActive
                 ) else {
-                    outcome = .actionSuppressed
-                    return
-                }
-            }
-
-            if hasTextToInsert {
-                self.log("[TypingService] Delay completed, calling insertTextInstantly")
-                let insertStartedAt = ProcessInfo.processInfo.systemUptime
-                self.bench("insert_call")
-                let inserted = self.insertTextInstantly(text, preferredTargetPID: preferredTargetPID)
-                self.bench(
-                    "insert_return elapsedMs=\(Self.elapsedMs(since: insertStartedAt)) totalMs=\(Self.elapsedMs(since: requestedAt))"
-                )
-                guard inserted else {
-                    outcome = .insertionFailed
+                    outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
                     return
                 }
 
-                outcome = .inserted
+                usleep(50_000)
+                guard Self.isExactFocusTargetActive(requiredFocusTarget),
+                      self.postReturnKey(postInsertionKey, targetPID: preferredTargetPID)
+                else {
+                    outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
+                    return
+                }
+                outcome = hasTextToInsert ? .insertedAndActionDispatched : .actionDispatched
             }
-
-            guard let postInsertionKey else { return }
-            guard let preferredTargetPID, let requiredFocusTarget else {
-                outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
-                return
-            }
-            let modifiersReleased = self.waitForPhysicalModifiersToRelease(timeout: 2)
-            let exactFocusIsActive = Self.isExactFocusTargetActive(requiredFocusTarget)
-            guard Self.canDispatchPostInsertionAction(
-                preferredTargetPID: preferredTargetPID,
-                requiredTargetPID: requiredFocusTarget.pid,
-                isSecureTextField: requiredFocusTarget.isSecureTextField,
-                modifiersReleased: modifiersReleased,
-                exactFocusIsActive: exactFocusIsActive
-            ) else {
-                outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
-                return
-            }
-
-            usleep(50_000)
-            guard Self.isExactFocusTargetActive(requiredFocusTarget),
-                  self.postReturnKey(postInsertionKey, targetPID: preferredTargetPID)
-            else {
-                outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
-                return
-            }
-            outcome = hasTextToInsert ? .insertedAndActionDispatched : .actionDispatched
         }
     }
 

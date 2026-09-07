@@ -5,6 +5,42 @@ import Foundation
 import XCTest
 
 final class DirectAudioReliabilityTests: XCTestCase {
+    func testPipelineCorrelationIsInheritedAndRestoredAcrossConcurrentRequests() async {
+        let original = DebugLogger.pipelineID
+        let values = await withTaskGroup(of: String?.self, returning: [String?].self) { group in
+            for id in ["pipeline-a", "pipeline-b"] {
+                group.addTask {
+                    await DebugLogger.$pipelineID.withValue(id) {
+                        await Task.yield()
+                        return await Task { DebugLogger.pipelineID }.value
+                    }
+                }
+            }
+            var values: [String?] = []
+            for await value in group {
+                values.append(value)
+            }
+            return values
+        }
+        XCTAssertEqual(Set(values.compactMap { $0 }), ["pipeline-a", "pipeline-b"])
+        XCTAssertEqual(DebugLogger.pipelineID, original)
+    }
+
+    func testPipelineCorrelationCanCrossDispatchWithoutLeakingToNextWork() async {
+        let values: [String?] = await DebugLogger.$pipelineID.withValue("pipeline-a") {
+            let captured = DebugLogger.pipelineID
+            return await withCheckedContinuation { continuation in
+                DispatchQueue.global().async {
+                    let before = DebugLogger.pipelineID
+                    let inside = DebugLogger.$pipelineID.withValue(captured) { DebugLogger.pipelineID }
+                    let after = DebugLogger.pipelineID
+                    continuation.resume(returning: [before, inside, after])
+                }
+            }
+        }
+        XCTAssertEqual(values, [nil, "pipeline-a", nil])
+    }
+
     @MainActor
     func testAIStreamPreviewCoalescesBurstIntoOneMainActorUpdate() async {
         var publishedText: [String] = []

@@ -145,7 +145,7 @@ class DictationLogSummaryTests(unittest.TestCase):
             row("APP_BENCH", 1, "begin_recording"),
             row("APP_BENCH", 2, "pipeline_begin id=A"),
             row("APP_BENCH", 2.100, "ai_process_call id=A provider=fluid-1 model=fluid-1 inputChars=40"),
-            "[12:00:00.000] [INFO] [PrivateAIProvider] Private provider post-processing complete "
+            "[12:00:00.000] [INFO] [PrivateAIProvider] pipelineID=A Private provider post-processing complete "
             "backend=FluidDecode model=fluid-1 setupMs=1 requestMs=31 returnMs=0 totalMs=30 "
             "prefillMs=8 ttftMs=9 decodeMs=21",
             row("APP_BENCH", 2.140, "ai_process_return id=A"),
@@ -174,6 +174,59 @@ class DictationLogSummaryTests(unittest.TestCase):
         )[0]
 
         self.assertIsNone(result["metrics"]["fi_request_ms"])
+
+    def test_request_ids_route_every_family_and_reject_unknown_requests(self):
+        results = self.parse(
+            row("APP_BENCH", 1, "pipeline_begin id=A pipelineID=A"),
+            row("APP_BENCH", 2, "pipeline_begin id=B pipelineID=B"),
+            "pipelineID=A TYPING_BENCH t=2.1 complete",
+            "pipelineID=unknown LLM_BENCH t=2.2 call_enter",
+            "TYPING_BENCH t=2.3 complete",
+            "pipelineID=A DICTATION_SUMMARY asrMs=30 aiMs=-1 readyMs=50 appOverheadMs=20 outcome=success",
+        )
+        self.assertEqual(results[0]["from_stop_ms"]["paste_done"], 1100)
+        self.assertIsNone(results[1]["from_stop_ms"]["paste_done"])
+        self.assertIsNone(results[1]["from_stop_ms"]["llm_call_enter"])
+        self.assertEqual(results[0]["ready_outcome"], "success")
+        self.assertEqual(results[0]["outcome"], "paste done; callback missing")
+        self.assertEqual(results[0]["metrics"]["summary_asr_ms"], 30)
+        self.assertIsNone(results[0]["metrics"]["summary_ai_ms"])
+
+    def test_single_unlabelled_fi_result_is_not_authoritative(self):
+        result = self.parse(
+            row("APP_BENCH", 1, "pipeline_begin id=A"),
+            row("APP_BENCH", 1.1, "ai_process_call id=A"),
+            "Private provider post-processing complete requestMs=30",
+            row("APP_BENCH", 1.2, "ai_process_fail id=A"),
+        )[0]
+        self.assertIsNone(result["metrics"]["fi_request_ms"])
+        self.assertEqual(result["metrics"]["ai_processing_ms"], 100)
+        self.assertEqual(result["correlation"], "legacy_proximity_uncertain")
+
+    def test_malformed_numbers_are_missing_not_zero_or_crashes(self):
+        result = self.parse(
+            row("APP_BENCH", 1, "pipeline_begin id=A"),
+            row("ASR_BENCH", 1.1, "final_done samples=no audioMs=nan textChars=inf"),
+        )[0]
+        self.assertIsNone(result["context"]["samples"])
+        self.assertIsNone(result["context"]["audio_ms"])
+        self.assertIsNone(result["context"]["text_chars"])
+
+    def test_terminal_outcomes_are_not_relabelled_as_external_insertion(self):
+        for outcome in ("sandbox", "internal_editor", "insertedAndActionDispatched",
+                        "insertedActionSuppressed", "actionSuppressed", "rejected", "insertionFailed"):
+            with self.subTest(outcome=outcome):
+                result = self.parse(
+                    row("APP_BENCH", 1, "pipeline_begin id=A pipelineID=A"),
+                    f"pipelineID=A PIPELINE_SUMMARY t=1.1 id=A outcome={outcome} totalMs=100",
+                )[0]
+                self.assertEqual(result["outcome"], outcome)
+                self.assertEqual(result["metrics"]["stop_to_delivery_ms"], 100)
+
+    def test_restart_does_not_deduplicate_a_new_recording_with_reused_values(self):
+        begin = row("APP_BENCH", 1, "begin_recording")
+        results = self.parse(begin, "[RUN] new process", begin)
+        self.assertEqual(len(results), 2)
 
     def test_concurrent_private_results_are_not_misattributed_to_dictation(self):
         result = self.parse(

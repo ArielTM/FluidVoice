@@ -14,15 +14,15 @@ struct DictationAudioMetadata: Codable, Equatable, Sendable {
 
 final class DictationAudioHistoryStore {
     static let shared = DictationAudioHistoryStore()
-    @discardableResult func deleteAudio(fileName: String) -> Int { 0 }
+    @discardableResult func deleteAudio(fileName: String) -> Int64 { 0 }
     func deleteAllAudioFiles() {}
-    func audioUsageBytes() -> Int { 0 }
-    func deleteUnreferencedAudioFiles(referencedFileNames: Set<String>) -> (fileCount: Int, byteCount: Int) { (0, 0) }
+    func audioUsageBytes() -> Int64 { 0 }
+    func deleteUnreferencedAudioFiles(referencedFileNames: Set<String>) -> (fileCount: Int, byteCount: Int64) { (0, 0) }
 }
 
 @MainActor final class SettingsStore {
     static let shared = SettingsStore()
-    var audioHistoryBudgetBytes: Int { 1_000_000 }
+    var audioHistoryBudgetBytes: Int64 { 1_000_000 }
     var weekendsDontBreakStreak: Bool { false }
 }
 
@@ -165,22 +165,37 @@ final class DebugLogger {
 
     @MainActor static func testTodaySummary(root: URL, defaults: UserDefaults, audio: DictationAudioMetadata) async throws {
         let formatter = ISO8601DateFormatter()
-        var now = formatter.date(from: "2026-03-08T18:00:00Z")!
+        guard var now = formatter.date(from: "2026-03-08T18:00:00Z"),
+              let losAngeles = TimeZone(identifier: "America/Los_Angeles"),
+              let plusFourteen = TimeZone(secondsFromGMT: 14 * 3600)
+        else { preconditionFailure("Invalid calendar fixtures") }
         var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        calendar.timeZone = losAngeles
         var clockReads = 0
         let writer = TranscriptionHistoryWriter(defaults: defaults, url: root.appendingPathComponent("summary.sqlite3"))
-        let store = TranscriptionHistoryStore(writer: writer, summaryNow: {
-            clockReads += 1
-            return now
-        }, summaryCalendar: { calendar })
+        let store = TranscriptionHistoryStore(
+            writer: writer,
+            summaryNow: {
+                clockReads += 1
+                return now
+            },
+            summaryCalendar: { calendar }
+        )
         try await store.waitUntilLoaded()
         await store.waitForTodaySummary()
-        let day = calendar.dateInterval(of: .day, for: now)!
+        guard let day = calendar.dateInterval(of: .day, for: now) else {
+            preconditionFailure("Missing fixture day")
+        }
         precondition(day.duration == 23 * 3600, "Fixture must exercise a DST-shortened day")
         func entry(_ timestamp: Date, _ text: String) -> TranscriptionHistoryEntry {
-            TranscriptionHistoryEntry(timestamp: timestamp, rawText: text, processedText: text,
-                                      appName: "Test", windowTitle: "Test", wasAIProcessed: false)
+            TranscriptionHistoryEntry(
+                timestamp: timestamp,
+                rawText: text,
+                processedText: text,
+                appName: "Test",
+                windowTitle: "Test",
+                wasAIProcessed: false
+            )
         }
         let yesterday = entry(day.start.addingTimeInterval(-1), "not today")
         let first = entry(day.start, "  one\t two\nthree  ")
@@ -240,12 +255,12 @@ final class DebugLogger {
         await store.waitForTodaySummary()
         precondition(store.todaySummary == .init(words: 2, transcriptions: 1), "Midnight must refresh without a dictation")
         now = day.end.addingTimeInterval(12 * 3600)
-        calendar.timeZone = TimeZone(secondsFromGMT: 14 * 3600)!
+        calendar.timeZone = plusFourteen
         store.refreshTodaySummaryForCalendarChange()
         await store.waitForTodaySummary()
         precondition(store.todaySummary == .init(words: 0, transcriptions: 0), "Timezone changes must redefine today")
         now = yesterday.timestamp
-        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        calendar.timeZone = losAngeles
         store.refreshTodaySummaryForCalendarChange()
         await store.waitForTodaySummary()
         precondition(store.todaySummary == .init(words: 2, transcriptions: 1), "Clock moving backward must refresh")
