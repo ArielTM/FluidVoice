@@ -26,6 +26,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     // References to app state
     private weak var asrService: ASRService?
     private var cancellables = Set<AnyCancellable>()
+    private var hasDeferredStopMenuRefresh = false
+    private var hasDeferredStoppedRecordingState = false
     private var configuredASRIdentifier: ObjectIdentifier?
 
     /// Overlay management (persistent, independent of window lifecycle)
@@ -105,12 +107,38 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         asrService.$isRunning
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRunning in
-                self?.isRecording = isRunning
-                self?.updateMenuBarIcon()
-                self?.updateMenu()
+                guard let self else { return }
+                if isRunning == false, self.isProcessingActive {
+                    self.hasDeferredStoppedRecordingState = true
+                    self.overlayBench("recording_state_deferred reason=processing_active")
+                    self.handleOverlayState(isRunning: false, asrService: asrService)
+                    return
+                }
+                if isRunning {
+                    self.hasDeferredStoppedRecordingState = false
+                }
+                self.isRecording = isRunning
+                self.updateMenuBarIcon()
+                if asrService.defersStopUIInvalidation {
+                    self.hasDeferredStopMenuRefresh = true
+                } else {
+                    self.updateMenu()
+                }
 
                 // Handle overlay lifecycle (independent of window state)
-                self?.handleOverlayState(isRunning: isRunning, asrService: asrService)
+                self.handleOverlayState(isRunning: isRunning, asrService: asrService)
+            }
+            .store(in: &self.cancellables)
+
+        asrService.deferredStopUIInvalidationDidFlush
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                guard let self,
+                      self.hasDeferredStopMenuRefresh,
+                      self.hasDeferredStoppedRecordingState == false
+                else { return }
+                self.hasDeferredStopMenuRefresh = false
+                self.updateMenu()
             }
             .store(in: &self.cancellables)
 
@@ -348,19 +376,26 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         NotchOverlayManager.shared.setMode(mode)
     }
 
+    /// Keeps the recording overlay owned by the active pipeline without
+    /// publishing processing UI. The latency-critical stop path uses this so
+    /// SwiftUI work cannot queue ahead of final transcription.
+    func reserveProcessingOverlay() {
+        self.overlayBench(
+            "reserve_processing overlayVisible=\(self.overlayVisible) active=\(self.isProcessingActive)"
+        )
+        self.isProcessingActive = true
+        self.pendingProcessingShowOperation?.cancel()
+        self.pendingProcessingShowOperation = nil
+        self.pendingHideOperation?.cancel()
+        self.pendingHideOperation = nil
+        self.overlayVisible = true
+    }
+
     func setProcessing(_ processing: Bool) {
         self.overlayBench("set_processing_request processing=\(processing) overlayVisible=\(self.overlayVisible) active=\(self.isProcessingActive)")
 
-        // Track processing state to prevent hide during AI refinement
-        self.isProcessingActive = processing
-        self.updateMenuItemsText()
-
         if processing {
-            self.pendingProcessingShowOperation?.cancel()
-            // Cancel any pending hide - we want to keep the overlay visible for AI processing
-            self.pendingHideOperation?.cancel()
-            self.pendingHideOperation = nil
-            self.overlayVisible = true
+            self.reserveProcessingOverlay()
 
             let showItem = DispatchWorkItem { [weak self] in
                 guard let self = self, self.isProcessingActive else { return }
@@ -372,6 +407,8 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
             self.pendingProcessingShowOperation = showItem
             DispatchQueue.main.asyncAfter(deadline: .now() + self.processingVisualDelay, execute: showItem)
         } else {
+            defer { self.flushDeferredStoppedRecordingState() }
+            self.isProcessingActive = false
             self.pendingProcessingShowOperation?.cancel()
             self.pendingProcessingShowOperation = nil
             // When processing ends, schedule the hide (unless expanded output is showing)
@@ -407,18 +444,29 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         }
     }
 
+    /// Removes the successful recording overlay after insertion completes. There
+    /// is intentionally no separate exit animation on this latency-critical path.
+    func beginProcessingCompletionAndHideOverlay() {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        self.prepareForProcessingCompletion()
+        self.overlayBench("finish_hide_request mode=immediate")
+        NotchOverlayManager.shared.hideImmediately()
+        self.flushDeferredStoppedRecordingState()
+        self.overlayBench(
+            "finish_hide_complete mode=immediate elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
+        )
+    }
+
     /// Ends processing and waits for the recording overlay's exit transition.
-    /// Output paths normally call this asynchronously after insertion dispatch
-    /// so the exit animation cannot delay text delivery.
+    /// Use only when the caller must know the overlay has fully disappeared.
     func finishProcessingAndHideOverlay() async {
         let startedAt = ProcessInfo.processInfo.systemUptime
-        self.cancelPendingProcessingCompletionOperations()
-        self.isProcessingActive = false
-        self.overlayVisible = false
+        self.prepareForProcessingCompletion()
 
         NotchOverlayManager.shared.setProcessing(false)
-        self.overlayBench("finish_hide_request")
+        self.overlayBench("finish_hide_request mode=awaited")
         let hideOutcome = await NotchOverlayManager.shared.hideAndWait()
+        self.flushDeferredStoppedRecordingState()
         self.overlayBench(
             "finish_hide_complete outcome=\(hideOutcome) elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
         )
@@ -433,7 +481,24 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         // ownership so the next recording can establish a fresh lifecycle.
         self.overlayVisible = false
         NotchOverlayManager.shared.setProcessing(false)
+        self.flushDeferredStoppedRecordingState()
         self.overlayBench("finish_keep_visible")
+    }
+
+    /// Recording-state observers rebuild AppKit/SwiftUI surfaces. Hold that work
+    /// while a fast ASR/AI result is in flight, then publish it after output.
+    /// Slow paths call this when their processing status becomes visible.
+    func flushDeferredStoppedRecordingState() {
+        guard self.hasDeferredStoppedRecordingState else { return }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        self.hasDeferredStoppedRecordingState = false
+        self.hasDeferredStopMenuRefresh = false
+        self.isRecording = false
+        self.updateMenuBarIcon()
+        self.updateMenu()
+        self.overlayBench(
+            "recording_state_flushed elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
+        )
     }
 
     private func cancelPendingProcessingCompletionOperations() {
@@ -443,6 +508,12 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         self.pendingHideOperation = nil
         self.pendingShowOperation?.cancel()
         self.pendingShowOperation = nil
+    }
+
+    private func prepareForProcessingCompletion() {
+        self.cancelPendingProcessingCompletionOperations()
+        self.isProcessingActive = false
+        self.overlayVisible = false
     }
 
     private func overlayBench(_ message: String) {

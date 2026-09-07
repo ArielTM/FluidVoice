@@ -23,16 +23,43 @@ enum KeychainServiceError: Error, LocalizedError {
 final class KeychainService {
     static let shared = KeychainService()
 
+    private struct TestingBackend {
+        let load: () throws -> [String: String]
+        let save: ([String: String]) throws -> Void
+    }
+
+    private enum KeyCache {
+        case unloaded
+        case loaded([String: String])
+    }
+
     private let service = "com.fluidvoice.provider-api-keys"
     private let account = "fluidApiKeys"
+    private let cacheLock = NSLock()
+    private let ioLock = NSRecursiveLock()
+    private var keyCache = KeyCache.unloaded
+    private let testingBackend: TestingBackend?
 
-    private init() {}
+    private init() {
+        self.testingBackend = nil
+    }
+
+    init(
+        testingLoad: @escaping () throws -> [String: String],
+        testingSave: @escaping ([String: String]) throws -> Void
+    ) {
+        self.testingBackend = TestingBackend(load: testingLoad, save: testingSave)
+    }
 
     // MARK: - Public API
 
     func storeKey(_ key: String, for providerID: String) throws {
+        self.ioLock.lock()
+        defer { self.ioLock.unlock() }
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        var keys = try loadStoredKeys()
+        // Mutations are rare and must merge against the latest aggregate in
+        // case another app instance or Keychain Access changed it.
+        var keys = try self.loadStoredKeys(forceRefresh: true)
         keys[providerID] = trimmed
         try self.saveStoredKeys(keys)
     }
@@ -43,7 +70,9 @@ final class KeychainService {
     }
 
     func deleteKey(for providerID: String) throws {
-        var keys = try loadStoredKeys()
+        self.ioLock.lock()
+        defer { self.ioLock.unlock() }
+        var keys = try self.loadStoredKeys(forceRefresh: true)
         guard keys.removeValue(forKey: providerID) != nil else { return }
         try self.saveStoredKeys(keys)
     }
@@ -61,11 +90,21 @@ final class KeychainService {
         try self.loadStoredKeys()
     }
 
+    /// Refreshes the process cache after the user returns to FluidVoice, so
+    /// Keychain Access or another app instance cannot leave credentials stale.
+    /// Callers should run this away from the main thread because Keychain I/O
+    /// may wait for the login keychain to become available.
+    func refreshCachedKeys() throws {
+        _ = try self.loadStoredKeys(forceRefresh: true)
+    }
+
     func storeAllKeys(_ values: [String: String]) throws {
         try self.saveStoredKeys(values)
     }
 
     func legacyProviderEntries() throws -> [String: String] {
+        self.ioLock.lock()
+        defer { self.ioLock.unlock() }
         var result: [String: String] = [:]
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -113,6 +152,8 @@ final class KeychainService {
     }
 
     func removeLegacyEntries(providerIDs: [String] = []) throws {
+        self.ioLock.lock()
+        defer { self.ioLock.unlock() }
         let targets: [String]
         if !providerIDs.isEmpty {
             targets = providerIDs
@@ -130,7 +171,25 @@ final class KeychainService {
 
     // MARK: - Private helpers
 
-    private func loadStoredKeys() throws -> [String: String] {
+    private func loadStoredKeys(forceRefresh: Bool = false) throws -> [String: String] {
+        if !forceRefresh, case let .loaded(keys) = self.cachedState() { return keys }
+
+        self.ioLock.lock()
+        defer { self.ioLock.unlock() }
+        // A concurrent cold read may have populated the cache while this caller
+        // waited for I/O ownership. Forced refreshes intentionally bypass it.
+        if !forceRefresh, case let .loaded(keys) = self.cachedState() { return keys }
+
+        let keys = try self.readStoredKeys()
+        self.setCachedKeys(keys)
+        return keys
+    }
+
+    private func readStoredKeys() throws -> [String: String] {
+        if let testingBackend {
+            return try testingBackend.load()
+        }
+
         var query = self.aggregatedQuery()
         query[kSecReturnData as String] = kCFBooleanTrue
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -143,9 +202,7 @@ final class KeychainService {
             guard let data = item as? Data else {
                 throw KeychainServiceError.invalidData
             }
-            if data.isEmpty {
-                return [:]
-            }
+            if data.isEmpty { return [:] }
             do {
                 return try JSONDecoder().decode([String: String].self, from: data)
             } catch {
@@ -159,6 +216,14 @@ final class KeychainService {
     }
 
     private func saveStoredKeys(_ keys: [String: String]) throws {
+        self.ioLock.lock()
+        defer { self.ioLock.unlock() }
+        if let testingBackend {
+            try testingBackend.save(keys)
+            self.setCachedKeys(keys)
+            return
+        }
+
         let data = try JSONEncoder().encode(keys)
 
         var attributes = self.aggregatedQuery()
@@ -168,6 +233,7 @@ final class KeychainService {
 
         switch status {
         case errSecSuccess:
+            self.setCachedKeys(keys)
             try self.removeLegacyEntries()
             return
         case errSecDuplicateItem:
@@ -181,10 +247,23 @@ final class KeychainService {
             guard updateStatus == errSecSuccess else {
                 throw KeychainServiceError.unhandled(updateStatus)
             }
+            self.setCachedKeys(keys)
             try self.removeLegacyEntries()
         default:
             throw KeychainServiceError.unhandled(status)
         }
+    }
+
+    private func cachedState() -> KeyCache {
+        self.cacheLock.lock()
+        defer { self.cacheLock.unlock() }
+        return self.keyCache
+    }
+
+    private func setCachedKeys(_ keys: [String: String]) {
+        self.cacheLock.lock()
+        self.keyCache = .loaded(keys)
+        self.cacheLock.unlock()
     }
 
     private func aggregatedQuery() -> [String: Any] {

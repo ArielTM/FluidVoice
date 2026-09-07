@@ -159,7 +159,8 @@ final class BackupService {
 
     private init() {}
 
-    func makeBackupDocument() async -> AppBackupDocument {
+    func makeBackupDocument() async throws -> AppBackupDocument {
+        try await TranscriptionHistoryStore.shared.waitUntilLoaded()
         let pronunciationProfiles = await PronunciationDictionaryStore.shared.allProfiles()
         return AppBackupDocument(
             schemaVersion: .current,

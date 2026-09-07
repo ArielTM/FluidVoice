@@ -26,6 +26,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Bring up file logging + crash handlers immediately during launch.
         _ = FileLogger.shared
+        TypingService.startKeyboardLayoutTracking()
+        _ = TranscriptionHistoryStore.shared
         // Must be read during the launch callback - the current Apple Event identifies
         // login-item launches (used to optionally start silently, see issue #369).
         self.wasLaunchedAsLoginItem = Self.detectLoginItemLaunch()
@@ -60,6 +62,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Note: App UI is designed with dark color scheme in mind
         // All gradients and effects are optimized for dark mode
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            await TranscriptionHistoryStore.shared.finishPendingWrites()
+            if let error = TranscriptionHistoryStore.shared.persistenceError {
+                let alert = NSAlert()
+                alert.messageText = "History could not be saved"
+                alert.informativeText = error
+                alert.addButton(withTitle: "Keep Open")
+                alert.addButton(withTitle: "Quit Anyway")
+                sender.reply(toApplicationShouldTerminate: alert.runModal() == .alertSecondButtonReturn)
+                return
+            }
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -127,6 +146,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        DispatchQueue.global(qos: .utility).async {
+            try? KeychainService.shared.refreshCachedKeys()
+        }
         if let deadline = self.analyticsActivationSuppressionDeadline, Date() <= deadline {
             self.analyticsActivationSuppressionDeadline = nil
         } else {

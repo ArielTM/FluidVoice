@@ -15,6 +15,133 @@ final class AnalyticsDatabaseTests: XCTestCase {
         try? FileManager.default.removeItem(at: self.temporaryDirectory)
     }
 
+    func testBetaPerformanceCollectionUsesInstalledVersion() {
+        XCTAssertTrue(AnalyticsBuildPolicy.automaticallyCollectsDictationPerformance(appVersion: "1.6.10-beta.1"))
+        XCTAssertTrue(AnalyticsBuildPolicy.automaticallyCollectsDictationPerformance(appVersion: "2.0-BETA"))
+        XCTAssertFalse(AnalyticsBuildPolicy.automaticallyCollectsDictationPerformance(appVersion: "1.6.10"))
+        XCTAssertFalse(AnalyticsBuildPolicy.automaticallyCollectsDictationPerformance(appVersion: "unknown"))
+    }
+
+    func testDictationSummaryIsOneStableLineAndNamesSlowestStage() {
+        let line = DictationPerformanceLogSummary.line(
+            asrMilliseconds: 52,
+            aiMilliseconds: 150,
+            readyMilliseconds: 225,
+            outcome: "success"
+        )
+
+        XCTAssertEqual(
+            line,
+            "DICTATION_SUMMARY asrMs=52 aiMs=150 appOverheadMs=23 readyMs=225 " +
+                "slowest=ai outcome=success"
+        )
+        XCTAssertFalse(line.contains("\n"))
+    }
+
+    func testBetaPerformanceIsAggregatedIntoOneDailyDistribution() throws {
+        let database = try self.makeDatabase()
+        let firstDay = Date(timeIntervalSince1970: 1_735_689_600)
+        let secondDay = firstDay.addingTimeInterval(24 * 60 * 60)
+
+        try database.recordDictationPerformance(
+            asrMilliseconds: 20,
+            fluidIntelligenceMilliseconds: 100,
+            measuredAppVersion: "1.6.10-beta.1",
+            at: firstDay
+        )
+        try database.recordDictationPerformance(
+            asrMilliseconds: 60,
+            fluidIntelligenceMilliseconds: 900,
+            measuredAppVersion: "1.6.10-beta.1",
+            at: firstDay.addingTimeInterval(60)
+        )
+        try database.recordDictationPerformance(
+            asrMilliseconds: 1600,
+            fluidIntelligenceMilliseconds: nil,
+            measuredAppVersion: "1.6.10-beta.1",
+            at: firstDay.addingTimeInterval(120)
+        )
+        try database.finalizeDays(before: secondDay)
+
+        let events = try self.events(in: database).filter {
+            $0.name == AnalyticsEvent.dictationPerformanceDailySummary.rawValue
+        }
+        let summary = try XCTUnwrap(events.first)
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(summary.properties["measured_app_version"] as? String, "1.6.10-beta.1")
+        XCTAssertEqual(summary.properties["measured_os_version"] as? String, "macOS 15.6.1")
+        XCTAssertEqual(summary.properties["asr_sample_count"] as? Int, 3)
+        XCTAssertEqual(summary.properties["asr_p50_bucket"] as? String, "75")
+        XCTAssertEqual(summary.properties["asr_p95_bucket"] as? String, "2000")
+        XCTAssertEqual(summary.properties["fluid_intelligence_sample_count"] as? Int, 2)
+        XCTAssertEqual(summary.properties["fluid_intelligence_p50_bucket"] as? String, "100")
+        XCTAssertEqual(summary.properties["fluid_intelligence_p95_bucket"] as? String, "1000")
+        XCTAssertNil(summary.properties["asr_average_ms"])
+        XCTAssertNil(summary.properties["asr_max_ms"])
+        XCTAssertNil(summary.properties["fluid_intelligence_average_ms"])
+        XCTAssertNil(summary.properties["fluid_intelligence_max_ms"])
+        XCTAssertNil(summary.properties["os_version"])
+        XCTAssertNil(summary.properties["transcript"])
+        XCTAssertNil(summary.properties["window_title"])
+    }
+
+    func testDetailedOptOutPreservesAutomaticBetaPerformanceSummary() throws {
+        let database = try self.makeDatabase()
+        let firstDay = Date(timeIntervalSince1970: 1_735_689_600)
+        let secondDay = firstDay.addingTimeInterval(24 * 60 * 60)
+
+        try database.recordDictationPerformance(
+            asrMilliseconds: 75,
+            fluidIntelligenceMilliseconds: 200,
+            measuredAppVersion: "1.6.10-beta.1",
+            at: firstDay
+        )
+        try database.purgeDetailedAnalytics()
+        try database.finalizeDays(before: secondDay)
+
+        let names = try self.events(in: database).map(\.name)
+        XCTAssertEqual(names, [AnalyticsEvent.dictationPerformanceDailySummary.rawValue])
+    }
+
+    func testPerformanceSummaryKeepsOSVersionFromMeasurementTime() throws {
+        let databaseURL = self.temporaryDirectory.appendingPathComponent("analytics-os.sqlite3")
+        let firstDay = Date(timeIntervalSince1970: 1_735_689_600)
+        let secondDay = firstDay.addingTimeInterval(24 * 60 * 60)
+
+        do {
+            let database = try self.makeDatabase(
+                url: databaseURL,
+                systemConfiguration: AnalyticsSystemConfiguration(
+                    ramGB: 24,
+                    chip: "Apple M3 Pro",
+                    osVersion: "macOS 15.6.1"
+                )
+            )
+            try database.recordDictationPerformance(
+                asrMilliseconds: 75,
+                fluidIntelligenceMilliseconds: 200,
+                measuredAppVersion: "1.6.10-beta.1",
+                at: firstDay
+            )
+        }
+
+        let upgraded = try self.makeDatabase(
+            url: databaseURL,
+            systemConfiguration: AnalyticsSystemConfiguration(
+                ramGB: 24,
+                chip: "Apple M3 Pro",
+                osVersion: "macOS 16.0"
+            )
+        )
+        try upgraded.finalizeDays(before: secondDay)
+        let summary = try XCTUnwrap(
+            try self.events(in: upgraded).first {
+                $0.name == AnalyticsEvent.dictationPerformanceDailySummary.rawValue
+            }
+        )
+        XCTAssertEqual(summary.properties["measured_os_version"] as? String, "macOS 15.6.1")
+    }
+
     func testActivityIsDeduplicatedAndUsageIsAggregatedByDay() throws {
         let database = try self.makeDatabase()
         let firstDay = Date(timeIntervalSince1970: 1_735_689_600) // 2025-01-01 UTC
@@ -344,7 +471,14 @@ final class AnalyticsDatabaseTests: XCTestCase {
         XCTAssertEqual(events.map(\.name), [AnalyticsEvent.activeUser.rawValue])
     }
 
-    private func makeDatabase(url: URL? = nil) throws -> AnalyticsDatabase {
+    private func makeDatabase(
+        url: URL? = nil,
+        systemConfiguration: AnalyticsSystemConfiguration = AnalyticsSystemConfiguration(
+            ramGB: 24,
+            chip: "Apple M3 Pro",
+            osVersion: "macOS 15.6.1"
+        )
+    ) throws -> AnalyticsDatabase {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
         calendar.firstWeekday = 2
@@ -352,7 +486,7 @@ final class AnalyticsDatabaseTests: XCTestCase {
             url: url ?? self.temporaryDirectory.appendingPathComponent("analytics.sqlite3"),
             distinctID: "test-install-id",
             appVersion: "test",
-            systemConfiguration: AnalyticsSystemConfiguration(ramGB: 24, chip: "Apple M3 Pro"),
+            systemConfiguration: systemConfiguration,
             calendar: calendar
         )
     }

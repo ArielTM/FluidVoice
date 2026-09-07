@@ -31,6 +31,20 @@ struct TranscriptionHistoryView: View {
                 self.searchBar
                     .padding(12)
 
+                if self.historyStore.isLoading {
+                    ProgressView("Loading history…")
+                        .padding(12)
+                } else if let error = self.historyStore.persistenceError {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(error)
+                            .font(.caption)
+                        Button("Retry saving history") {
+                            self.historyStore.retryPersistence()
+                        }
+                    }
+                    .padding(12)
+                }
+
                 Divider()
                     .opacity(0.3)
 
@@ -43,6 +57,7 @@ struct TranscriptionHistoryView: View {
 
                 // Footer with stats and clear button
                 self.footerView
+                    .disabled(self.historyStore.isLoading)
             }
             .frame(minWidth: 280, idealWidth: 320, maxWidth: 400)
             .background(self.theme.palette.contentBackground)

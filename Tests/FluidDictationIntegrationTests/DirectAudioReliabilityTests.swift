@@ -1,9 +1,763 @@
+import Combine
 import CoreAudio
 @testable import FluidVoice_Debug
 import Foundation
 import XCTest
 
 final class DirectAudioReliabilityTests: XCTestCase {
+    func testPipelineCorrelationIsInheritedAndRestoredAcrossConcurrentRequests() async {
+        let original = DebugLogger.pipelineID
+        let values = await withTaskGroup(of: String?.self, returning: [String?].self) { group in
+            for id in ["pipeline-a", "pipeline-b"] {
+                group.addTask {
+                    await DebugLogger.$pipelineID.withValue(id) {
+                        await Task.yield()
+                        return await Task { DebugLogger.pipelineID }.value
+                    }
+                }
+            }
+            var values: [String?] = []
+            for await value in group {
+                values.append(value)
+            }
+            return values
+        }
+        XCTAssertEqual(Set(values.compactMap { $0 }), ["pipeline-a", "pipeline-b"])
+        XCTAssertEqual(DebugLogger.pipelineID, original)
+    }
+
+    func testPipelineCorrelationCanCrossDispatchWithoutLeakingToNextWork() async {
+        let values: [String?] = await DebugLogger.$pipelineID.withValue("pipeline-a") {
+            let captured = DebugLogger.pipelineID
+            return await withCheckedContinuation { continuation in
+                DispatchQueue.global().async {
+                    let before = DebugLogger.pipelineID
+                    let inside = DebugLogger.$pipelineID.withValue(captured) { DebugLogger.pipelineID }
+                    let after = DebugLogger.pipelineID
+                    continuation.resume(returning: [before, inside, after])
+                }
+            }
+        }
+        XCTAssertEqual(values, [nil, "pipeline-a", nil])
+    }
+
+    @MainActor
+    func testAIStreamPreviewCoalescesBurstIntoOneMainActorUpdate() async {
+        var publishedText: [String] = []
+        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 0, initialUpdateDelay: 0) { text in
+            publishedText.append(text)
+        }
+
+        preview.append("Fluid")
+        preview.append("Voice")
+        preview.append(" benchmark")
+        preview.flush()
+        await Task.yield()
+
+        XCTAssertEqual(publishedText, ["FluidVoice benchmark"])
+    }
+
+    @MainActor
+    func testAIStreamPreviewFlushesShortGenerationWithoutQueuedUIWork() async {
+        var publishedText: [String] = []
+        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 60, initialUpdateDelay: 60) { text in
+            publishedText.append(text)
+        }
+
+        preview.append("Exact output")
+        XCTAssertTrue(publishedText.isEmpty)
+
+        preview.flush()
+        preview.flush()
+        await Task.yield()
+
+        XCTAssertEqual(publishedText, ["Exact output"])
+    }
+
+    @MainActor
+    func testAIStreamPreviewReturnsToNormalCadenceAfterStartupGrace() async {
+        var publishedText: [String] = []
+        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 60, initialUpdateDelay: 0) { text in
+            publishedText.append(text)
+        }
+
+        preview.append("First")
+        await Task.yield()
+        preview.append(" second")
+        await Task.yield()
+
+        XCTAssertEqual(publishedText, ["First"])
+        preview.flush()
+        XCTAssertEqual(publishedText, ["First", "First second"])
+    }
+
+    @MainActor
+    func testCaptureSettledEventDoesNotInvalidateWholeASRService() {
+        let service = ASRService()
+        var settledEventCount = 0
+        var objectChangeCount = 0
+        let settledCancellable = service.audioCaptureStateDidSettle.sink {
+            settledEventCount += 1
+        }
+        let objectCancellable = service.objectWillChange.sink {
+            objectChangeCount += 1
+        }
+
+        service.audioCaptureStateDidSettle.send()
+
+        XCTAssertEqual(settledEventCount, 1)
+        XCTAssertEqual(objectChangeCount, 0)
+        withExtendedLifetime((settledCancellable, objectCancellable)) {}
+    }
+
+    func testStopUIInvalidationGateFinishesExactlyOnce() {
+        var gate = ASRStopUIInvalidationGate()
+
+        XCTAssertFalse(gate.isDeferring)
+        XCTAssertFalse(gate.finish())
+        gate.begin()
+        XCTAssertTrue(gate.isDeferring)
+        XCTAssertTrue(gate.finish())
+        XCTAssertFalse(gate.isDeferring)
+        XCTAssertFalse(gate.finish())
+    }
+
+    func testStopUIInvalidationGateWaitsForOutputPipelineHold() {
+        var gate = ASRStopUIInvalidationGate()
+
+        gate.holdForOutputPipeline()
+        gate.begin()
+
+        XCTAssertFalse(gate.finish())
+        XCTAssertTrue(gate.isDeferring)
+        XCTAssertTrue(gate.releaseOutputPipelineHold())
+        XCTAssertFalse(gate.isDeferring)
+        XCTAssertFalse(gate.releaseOutputPipelineHold())
+    }
+
+    func testStopUIInvalidationGateForceFinishBoundsHeldPipeline() {
+        var gate = ASRStopUIInvalidationGate()
+
+        gate.holdForOutputPipeline()
+        gate.begin()
+        XCTAssertFalse(gate.finish())
+
+        XCTAssertTrue(gate.forceFinish())
+        XCTAssertFalse(gate.isDeferring)
+        XCTAssertFalse(gate.forceFinish())
+    }
+
+    @MainActor
+    func testFinalTranscriptionStatusRunsAfterDelay() async {
+        var operationCount = 0
+        let task = scheduleDeferredMainActorOperation(afterNanoseconds: 0) {
+            operationCount += 1
+        }
+
+        await task.value
+
+        XCTAssertEqual(operationCount, 1)
+    }
+
+    @MainActor
+    func testCancelledFinalTranscriptionStatusHasNoSideEffect() async {
+        var operationCount = 0
+        let task = scheduleDeferredMainActorOperation(afterNanoseconds: 60_000_000_000) {
+            operationCount += 1
+        }
+
+        task.cancel()
+        await task.value
+
+        XCTAssertEqual(operationCount, 0)
+    }
+
+    @MainActor
+    func testDelayedFinalStatusCannotChangeANewerRecording() async {
+        var currentSession = 7
+        let stoppingSession = currentSession
+        var overlay = "Recording"
+        let staleTask = scheduleDeferredMainActorOperation(
+            afterNanoseconds: 0,
+            shouldRun: { currentSession == stoppingSession }
+        ) { overlay = "Transcribing" }
+        currentSession = 8
+        await staleTask.value
+        XCTAssertEqual(overlay, "Recording")
+
+        let currentTask = scheduleDeferredMainActorOperation(
+            afterNanoseconds: 0,
+            shouldRun: { currentSession == 8 }
+        ) { overlay = "Transcribing" }
+        await currentTask.value
+        XCTAssertEqual(overlay, "Transcribing")
+    }
+
+    @MainActor
+    func testStalledStreamingDrainIsBoundedWithoutCancellingProvider() async {
+        let lifecycle = StreamingTaskLifecycle()
+        var providerContinuation: CheckedContinuation<Void, Never>?
+        var providerWasCancelled = false
+        var completions = 0
+        lifecycle.schedule(sessionID: 7, delayNanoseconds: 0) { _ in
+            await withCheckedContinuation { providerContinuation = $0 }
+            providerWasCancelled = Task.isCancelled
+        } completion: { _ in completions += 1 }
+        while providerContinuation == nil {
+            await Task.yield()
+        }
+
+        let completed = await lifecycle.drain(sessionID: 7, timeoutNanoseconds: 1_000_000)
+        XCTAssertFalse(completed)
+        XCTAssertTrue(lifecycle.hasActiveWork, "Timeout must retain the provider and its incremental state")
+        XCTAssertEqual(lifecycle.pendingDrainCount, 0, "Timed-out waiters must be removed")
+        XCTAssertEqual(completions, 0)
+        XCTAssertFalse(lifecycle.schedule(sessionID: 8, delayNanoseconds: 0) { _ in
+            XCTFail("A replacement must not race the stalled provider")
+        } completion: { _ in })
+
+        let resumedDrain = Task { @MainActor in
+            await lifecycle.drain(sessionID: 7, timeoutNanoseconds: 60_000_000_000)
+        }
+        await Task.yield()
+        providerContinuation?.resume()
+        let recovered = await resumedDrain.value
+        XCTAssertTrue(recovered)
+        XCTAssertFalse(providerWasCancelled)
+        XCTAssertEqual(completions, 1)
+        XCTAssertFalse(lifecycle.hasActiveWork)
+        XCTAssertEqual(lifecycle.pendingDrainCount, 0, "Completion must retire its timer/waiter")
+    }
+
+    @MainActor
+    func testTimedOutHandoffWakesStartsButKeepsBufferOwnedUntilRecovery() async throws {
+        let gate = RecordingBufferHandoffGate()
+        let token = try XCTUnwrap(gate.begin())
+        var wokeInRecovery = false
+        let waitingStart = Task { @MainActor in
+            await gate.waitUntilAvailable()
+            wokeInRecovery = gate.isRecovering
+        }
+        while gate.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+        gate.markTimedOut(token)
+        await waitingStart.value
+        XCTAssertTrue(wokeInRecovery)
+        XCTAssertTrue(gate.isActive)
+        XCTAssertNil(gate.begin(), "Timeout must not release the PCM to another capture")
+        XCTAssertEqual(gate.pendingWaiterCount, 0)
+
+        let otherGate = RecordingBufferHandoffGate()
+        let staleToken = try XCTUnwrap(otherGate.begin())
+        gate.complete(staleToken)
+        XCTAssertTrue(gate.isRecovering)
+        gate.complete(token)
+        XCTAssertFalse(gate.isRecovering)
+        XCTAssertFalse(gate.isActive)
+        let nextToken = try XCTUnwrap(gate.begin())
+        gate.markTimedOut(token)
+        XCTAssertFalse(gate.isRecovering, "An old timeout cannot affect a fresh recording")
+        gate.complete(nextToken)
+    }
+
+    @MainActor
+    func testStreamingIdleSchedulerCancelsWithoutLaunchingOrActiveDrain() async {
+        let lifecycle = StreamingTaskLifecycle()
+        var operationStarted = false
+
+        XCTAssertTrue(lifecycle.schedule(
+            sessionID: 7,
+            delayNanoseconds: 60_000_000_000
+        ) { _ in
+            operationStarted = true
+        } completion: { _ in })
+        XCTAssertTrue(lifecycle.hasScheduledIdleWork)
+
+        XCTAssertTrue(lifecycle.cancelScheduler())
+        var mainActorSentinelRan = false
+        let sentinelTask = Task { @MainActor in
+            mainActorSentinelRan = true
+        }
+        let activeTask = lifecycle.activeTaskToDrain(sessionID: 7)
+
+        XCTAssertNil(activeTask)
+        XCTAssertFalse(mainActorSentinelRan, "An idle drain must not yield the main actor")
+        await sentinelTask.value
+        XCTAssertFalse(operationStarted)
+        XCTAssertFalse(lifecycle.hasScheduledIdleWork)
+        XCTAssertFalse(lifecycle.hasActiveWork)
+    }
+
+    @MainActor
+    func testStreamingActiveWorkDrainsWithoutCancellation() async {
+        let lifecycle = StreamingTaskLifecycle()
+        var operationStarted = false
+        var operationWasCancelled = false
+        var operationContinuation: CheckedContinuation<Void, Never>?
+        var completionCount = 0
+
+        XCTAssertTrue(lifecycle.schedule(
+            sessionID: 11,
+            delayNanoseconds: 0
+        ) { _ in
+            operationStarted = true
+            await withCheckedContinuation { continuation in
+                operationContinuation = continuation
+            }
+            operationWasCancelled = Task.isCancelled
+        } completion: { _ in
+            completionCount += 1
+        })
+
+        while operationStarted == false {
+            await Task.yield()
+        }
+        XCTAssertTrue(lifecycle.hasActiveWork)
+        XCTAssertFalse(lifecycle.cancelScheduler())
+
+        let drainTask = Task { @MainActor in
+            await lifecycle.drain(sessionID: 11, timeoutNanoseconds: 60_000_000_000)
+        }
+        await Task.yield()
+        XCTAssertEqual(completionCount, 0)
+
+        operationContinuation?.resume()
+        let drainedActiveWork = await drainTask.value
+        XCTAssertTrue(drainedActiveWork)
+
+        XCTAssertFalse(operationWasCancelled)
+        XCTAssertEqual(completionCount, 1)
+        XCTAssertFalse(lifecycle.hasActiveWork)
+    }
+
+    func testStreamingWorkStateRejectsStaleProviderAndOperationMutations() throws {
+        var state = StreamingTranscriptionWorkState()
+        state.beginSession(31)
+        let firstOperation = UUID()
+        let firstProviderGenerationValue = state.beginOperation(
+            sessionID: 31,
+            operationID: firstOperation
+        )
+        let firstProviderGeneration = try XCTUnwrap(firstProviderGenerationValue)
+        XCTAssertTrue(state.canPublish(
+            sessionID: 31,
+            operationID: firstOperation,
+            providerGeneration: firstProviderGeneration
+        ))
+
+        state.invalidateProvider()
+        XCTAssertFalse(state.canPublish(
+            sessionID: 31,
+            operationID: firstOperation,
+            providerGeneration: firstProviderGeneration
+        ))
+        XCTAssertTrue(state.finishOperation(sessionID: 31, operationID: firstOperation))
+
+        let secondOperation = UUID()
+        let secondProviderGeneration = state.beginOperation(
+            sessionID: 31,
+            operationID: secondOperation
+        )
+        _ = try XCTUnwrap(secondProviderGeneration)
+        XCTAssertFalse(state.finishOperation(sessionID: 31, operationID: firstOperation))
+        XCTAssertTrue(state.ownsOperation(sessionID: 31, operationID: secondOperation))
+
+        XCTAssertTrue(state.finishOperation(sessionID: 31, operationID: secondOperation))
+        state.endSession(31)
+        state.beginSession(32)
+        XCTAssertFalse(state.ownsOperation(sessionID: 31, operationID: secondOperation))
+    }
+
+    func testStreamingWorkStatePublishesOnlyForRunningCurrentSession() throws {
+        var state = StreamingTranscriptionWorkState()
+        state.beginSession(41)
+        let operationID = UUID()
+        let providerGeneration = try XCTUnwrap(state.beginOperation(
+            sessionID: 41,
+            operationID: operationID
+        ))
+
+        XCTAssertTrue(state.canPublishPreview(
+            sessionID: 41,
+            operationID: operationID,
+            providerGeneration: providerGeneration,
+            isRunning: true,
+            schedulingSessionID: 41
+        ))
+        XCTAssertFalse(state.canPublishPreview(
+            sessionID: 41,
+            operationID: operationID,
+            providerGeneration: providerGeneration,
+            isRunning: false,
+            schedulingSessionID: 41
+        ))
+        XCTAssertFalse(state.canPublishPreview(
+            sessionID: 41,
+            operationID: operationID,
+            providerGeneration: providerGeneration,
+            isRunning: true,
+            schedulingSessionID: nil
+        ))
+        XCTAssertFalse(state.canPublishPreview(
+            sessionID: 41,
+            operationID: operationID,
+            providerGeneration: providerGeneration,
+            isRunning: true,
+            schedulingSessionID: 42
+        ))
+
+        state.invalidateProvider()
+        XCTAssertFalse(state.canPublishPreview(
+            sessionID: 41,
+            operationID: operationID,
+            providerGeneration: providerGeneration,
+            isRunning: true,
+            schedulingSessionID: 41
+        ))
+    }
+
+    @MainActor
+    func testStoppedLateStreamingSuccessSkipsPreviewWorkAndStillDrains() async throws {
+        let lifecycle = StreamingTaskLifecycle()
+        var state = StreamingTranscriptionWorkState()
+        state.beginSession(51)
+        var isRunning = true
+        var schedulingSessionID: Int? = 51
+        var operationContinuation: CheckedContinuation<Void, Never>?
+        var formatCount = 0
+        var publishCount = 0
+        var cleanupCount = 0
+        var rearmCount = 0
+
+        XCTAssertTrue(lifecycle.schedule(
+            sessionID: 51,
+            delayNanoseconds: 0
+        ) { operationID in
+            guard let providerGeneration = state.beginOperation(
+                sessionID: 51,
+                operationID: operationID
+            ) else {
+                XCTFail("Expected the late success operation to own the session")
+                return
+            }
+            await withCheckedContinuation { continuation in
+                operationContinuation = continuation
+            }
+            guard state.canPublishPreview(
+                sessionID: 51,
+                operationID: operationID,
+                providerGeneration: providerGeneration,
+                isRunning: isRunning,
+                schedulingSessionID: schedulingSessionID
+            ) else { return }
+            formatCount += 1
+            publishCount += 1
+        } completion: { operationID in
+            if state.finishOperation(sessionID: 51, operationID: operationID) {
+                cleanupCount += 1
+            }
+            if isRunning, schedulingSessionID == 51 {
+                rearmCount += 1
+            }
+        })
+
+        while operationContinuation == nil {
+            await Task.yield()
+        }
+        isRunning = false
+        schedulingSessionID = nil
+        let activeTask = try XCTUnwrap(lifecycle.activeTaskToDrain(sessionID: 51))
+        operationContinuation?.resume()
+        _ = await activeTask.result
+
+        XCTAssertEqual(formatCount, 0)
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(cleanupCount, 1)
+        XCTAssertEqual(rearmCount, 0)
+        XCTAssertFalse(lifecycle.hasActiveWork)
+    }
+
+    @MainActor
+    func testStoppedLateStreamingFailureSkipsFailureMutationAndStillDrains() async throws {
+        let lifecycle = StreamingTaskLifecycle()
+        var state = StreamingTranscriptionWorkState()
+        state.beginSession(52)
+        var isRunning = true
+        var schedulingSessionID: Int? = 52
+        var operationContinuation: CheckedContinuation<Void, Never>?
+        var fallbackCount = 0
+        var failureMutationCount = 0
+        var cleanupCount = 0
+        var rearmCount = 0
+
+        XCTAssertTrue(lifecycle.schedule(
+            sessionID: 52,
+            delayNanoseconds: 0
+        ) { operationID in
+            guard let providerGeneration = state.beginOperation(
+                sessionID: 52,
+                operationID: operationID
+            ) else {
+                XCTFail("Expected the late failure operation to own the session")
+                return
+            }
+            await withCheckedContinuation { continuation in
+                operationContinuation = continuation
+            }
+            guard state.canPublishPreview(
+                sessionID: 52,
+                operationID: operationID,
+                providerGeneration: providerGeneration,
+                isRunning: isRunning,
+                schedulingSessionID: schedulingSessionID
+            ) else { return }
+            fallbackCount += 1
+            failureMutationCount += 1
+        } completion: { operationID in
+            if state.finishOperation(sessionID: 52, operationID: operationID) {
+                cleanupCount += 1
+            }
+            if isRunning, schedulingSessionID == 52 {
+                rearmCount += 1
+            }
+        })
+
+        while operationContinuation == nil {
+            await Task.yield()
+        }
+        isRunning = false
+        schedulingSessionID = nil
+        let activeTask = try XCTUnwrap(lifecycle.activeTaskToDrain(sessionID: 52))
+        operationContinuation?.resume()
+        _ = await activeTask.result
+
+        XCTAssertEqual(fallbackCount, 0)
+        XCTAssertEqual(failureMutationCount, 0)
+        XCTAssertEqual(cleanupCount, 1)
+        XCTAssertEqual(rearmCount, 0)
+        XCTAssertFalse(lifecycle.hasActiveWork)
+    }
+
+    @MainActor
+    func testCancelledPendingStartWakesWithoutCompletingBufferHandoff() async throws {
+        let gate = RecordingBufferHandoffGate()
+        let token = try XCTUnwrap(gate.begin())
+        var waiterReturned = false
+        let waiter = Task { @MainActor in
+            await gate.waitUntilAvailable()
+            waiterReturned = true
+        }
+        while gate.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+        XCTAssertFalse(waiterReturned)
+
+        gate.releasePendingWaiters()
+        await waiter.value
+
+        XCTAssertTrue(waiterReturned)
+        XCTAssertTrue(gate.isActive)
+        gate.complete(token)
+        XCTAssertFalse(gate.isActive)
+    }
+
+    @MainActor
+    func testBufferHandoffRejectsStaleCompletionAndReleasesOnOwnerCompletion() async throws {
+        let gate = RecordingBufferHandoffGate()
+        let ownerToken = try XCTUnwrap(gate.begin())
+        let otherGate = RecordingBufferHandoffGate()
+        let staleToken = try XCTUnwrap(otherGate.begin())
+        var waiterReturned = false
+        let waiter = Task { @MainActor in
+            await gate.waitUntilAvailable()
+            waiterReturned = true
+        }
+        while gate.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+
+        gate.complete(staleToken)
+        XCTAssertTrue(gate.isActive)
+        XCTAssertFalse(waiterReturned)
+
+        gate.complete(ownerToken)
+        await waiter.value
+        XCTAssertTrue(waiterReturned)
+        XCTAssertFalse(gate.isActive)
+    }
+
+    @MainActor
+    func testStreamingLifecycleContinuesCadenceAfterOperationCompletion() async {
+        let lifecycle = StreamingTaskLifecycle()
+        var operationCount = 0
+        var completionCount = 0
+
+        XCTAssertTrue(lifecycle.schedule(
+            sessionID: 19,
+            delayNanoseconds: 0
+        ) { _ in
+            operationCount += 1
+        } completion: { _ in
+            completionCount += 1
+            _ = lifecycle.schedule(
+                sessionID: 19,
+                delayNanoseconds: 0
+            ) { _ in
+                operationCount += 1
+            } completion: { _ in
+                completionCount += 1
+            }
+        })
+
+        while completionCount < 2 {
+            await Task.yield()
+        }
+        XCTAssertEqual(operationCount, 2)
+        XCTAssertEqual(completionCount, 2)
+        XCTAssertFalse(lifecycle.hasScheduledIdleWork)
+        XCTAssertFalse(lifecycle.hasActiveWork)
+    }
+
+    func testCaptureStoppedCallbackDoesNotReenqueueOnMainActor() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent("Sources/Fluid/Services/ASRService.swift"),
+            encoding: .utf8
+        )
+        let callbackSection = try XCTUnwrap(
+            source.components(separatedBy: "capture_stopped_callback_request").last?
+                .components(separatedBy: "capture_stopped_callback_return").first
+        )
+
+        XCTAssertTrue(callbackSection.contains("onCaptureStopped?()"))
+        XCTAssertFalse(callbackSection.contains("await "))
+        XCTAssertFalse(callbackSection.contains("Task {"))
+    }
+
+    func testNormalOutputDismissesOverlayInPasteDispatchTurn() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent("Sources/Fluid/ContentView.swift"),
+            encoding: .utf8
+        )
+        let normalOutputSection = try XCTUnwrap(
+            source.components(separatedBy: "if spokenSendAllowed {").last?
+                .components(separatedBy: "if spokenSendRequested, !spokenSendAllowed").first
+        )
+        let pasteIndex = try XCTUnwrap(normalOutputSection.range(of: "typeOutputPlanToActiveField("))
+        let deliveryCompletionIndex = try XCTUnwrap(normalOutputSection.range(of: "completion: { outcome in"))
+        let deliveryHandlerIndex = try XCTUnwrap(normalOutputSection.range(of: "self.handleTypingDelivery("))
+
+        XCTAssertLessThan(pasteIndex.lowerBound, deliveryCompletionIndex.lowerBound)
+        XCTAssertLessThan(deliveryCompletionIndex.lowerBound, deliveryHandlerIndex.lowerBound)
+        let hideIndex = try XCTUnwrap(normalOutputSection.range(of: "self.hideOverlayForDispatchedPaste("))
+        XCTAssertLessThan(deliveryHandlerIndex.lowerBound, hideIndex.lowerBound)
+        let dispatchHideSection = try XCTUnwrap(source.components(separatedBy: "private func hideOverlayForDispatchedPaste(").last?.components(separatedBy: "private func handleTypingDelivery(").first)
+        XCTAssertTrue(dispatchHideSection.contains("reason=paste_dispatched"))
+        XCTAssertTrue(dispatchHideSection.contains("self.overlayLifecycleID == lifecycleID"))
+        XCTAssertFalse(dispatchHideSection.contains("Task {"))
+        XCTAssertFalse(normalOutputSection.contains("Task { @MainActor in"))
+        XCTAssertFalse(
+            normalOutputSection[pasteIndex.lowerBound..<deliveryHandlerIndex.lowerBound]
+                .contains("updateTranscriptionText(\"\")")
+        )
+
+        let deliveryHandlerSection = try XCTUnwrap(
+            source.components(separatedBy: "private func handleTypingDelivery(").last?
+                .components(separatedBy: "private func hideOverlayAfterOutput()").first
+        )
+        XCTAssertTrue(deliveryHandlerSection.contains("self.overlayLifecycleID == expectedOverlayLifecycleID"))
+        XCTAssertTrue(normalOutputSection.contains("shouldHideOverlay: shouldHideOverlayAfterDelivery && spokenSendRequested"))
+        XCTAssertTrue(normalOutputSection.contains("shouldHide: shouldHideOverlayAfterDelivery && !spokenSendRequested"))
+        XCTAssertTrue(deliveryHandlerSection.contains("guard shouldHideOverlay else { return }"))
+        XCTAssertFalse(deliveryHandlerSection.contains("await self.menuBarManager.beginProcessingCompletionAndHideOverlay"))
+
+        let menuBarSource = try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent("Sources/Fluid/Services/MenuBarManager.swift"),
+            encoding: .utf8
+        )
+        let completionSection = try XCTUnwrap(
+            menuBarSource.components(separatedBy: "func beginProcessingCompletionAndHideOverlay() {").last?
+                .components(separatedBy: "func finishProcessingAndHideOverlay() async {").first
+        )
+        XCTAssertTrue(completionSection.contains("NotchOverlayManager.shared.hideImmediately()"))
+        XCTAssertFalse(completionSection.contains("NotchOverlayManager.shared.hide()"))
+
+        let postStopSection = try XCTUnwrap(
+            source.components(separatedBy: "let transcribedText = await asr.stop").last?
+                .components(separatedBy: "guard transcribedText.trimmingCharacters").first
+        )
+        XCTAssertFalse(postStopSection.contains("updateTranscriptionText(\"\")"))
+    }
+
+    func testSlowAIStatusAndPreviewAreScopedToCurrentOverlayLifecycle() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent("Sources/Fluid/ContentView.swift"),
+            encoding: .utf8
+        )
+        let slowStatusSection = try XCTUnwrap(
+            source.components(separatedBy: "private func makeAIProcessingFeedback(").last?
+                .components(separatedBy: "private func prepareOverlayForASRStop(").first
+        )
+
+        XCTAssertTrue(slowStatusSection.contains("self.overlayLifecycleID == lifecycleID"))
+        XCTAssertTrue(slowStatusSection.contains("self.menuBarManager.setProcessing(true)"))
+        XCTAssertTrue(slowStatusSection.contains("let streamPreview = DictationAIStreamPreviewBuffer"))
+
+        let stopSection = try XCTUnwrap(
+            source.components(separatedBy: "private func stopAndProcessTranscription(").last?
+                .components(separatedBy: "private func makeAIProcessingFeedback(").first
+        )
+        let lifecycleSnapshotIndex = try XCTUnwrap(
+            stopSection.range(of: "let expectedOverlayLifecycleID = self.overlayLifecycleID")
+        )
+        let ASRStopIndex = try XCTUnwrap(stopSection.range(of: "let transcribedText = await asr.stop"))
+        XCTAssertLessThan(lifecycleSnapshotIndex.lowerBound, ASRStopIndex.lowerBound)
+        XCTAssertEqual(
+            stopSection.components(separatedBy: "let expectedOverlayLifecycleID = self.overlayLifecycleID").count,
+            2
+        )
+    }
+
+    func testDictionaryTrackingStartsAfterDeliveryCallbackReturns() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent("Sources/Fluid/Services/TypingService.swift"),
+            encoding: .utf8
+        )
+        let completionSection = try XCTUnwrap(
+            source.components(separatedBy: "let completedOutcome = outcome").last?
+                .components(separatedBy: "self.log(\"[TypingService] Starting async text insertion process\")").first
+        )
+        let callbackIndex = try XCTUnwrap(completionSection.range(of: "completion?(completedOutcome)"))
+        let trackingIndex = try XCTUnwrap(
+            completionSection.range(of: "AutomaticDictionaryCorrectionTracker.shared.beginObservingInsertion")
+        )
+
+        XCTAssertLessThan(callbackIndex.lowerBound, trackingIndex.lowerBound)
+        XCTAssertTrue(completionSection.contains("completedOutcome.didInsert"))
+        XCTAssertTrue(completionSection.contains("dictionary_tracking_scheduled afterDeliveryCallback=true"))
+    }
+
     func testReadinessGatePreservesFirstPCMThatArrivesBeforeWait() async {
         let gate = AudioCaptureReadinessGate()
         gate.arm(sessionID: 41, attemptID: 1)
@@ -61,7 +815,10 @@ final class DirectAudioReliabilityTests: XCTestCase {
                 timeoutNanoseconds: 10_000_000_000
             )
         }
-        await Task.yield()
+        for _ in 0..<100 where !gate.hasRegisteredWaiter(sessionID: 41, attemptID: 1) {
+            await Task.yield()
+        }
+        XCTAssertTrue(gate.hasRegisteredWaiter(sessionID: 41, attemptID: 1))
 
         gate.arm(sessionID: 41, attemptID: 2)
 
@@ -287,6 +1044,83 @@ final class DirectAudioReliabilityTests: XCTestCase {
             recorder.events,
             ["make:48000", "start:48000", "invalidate:48000"]
         )
+    }
+
+    func testCancelledStopStillStopsHardwareAndRetainsPreparedInput() async throws {
+        let fingerprint = makeFingerprint(sampleRate: 48_000, bufferFrameSize: 512)
+        let recorder = DirectAudioEventRecorder(operationDelayMicroseconds: 2000)
+        let factory = FakeDirectAudioInputFactory(
+            fingerprints: [fingerprint],
+            recorder: recorder
+        )
+        let controller = DirectCoreAudioLifecycleController(
+            packetHandler: { _, _, _, _, _ in },
+            inputFactory: { deviceID, _ in
+                try factory.make(deviceID: deviceID)
+            },
+            fingerprintReader: { _ in fingerprint },
+            installsHardwareListeners: false,
+            onFormatInvalidated: { _ in }
+        )
+        _ = try await controller.start(
+            deviceID: fingerprint.deviceID,
+            deviceName: "Test microphone",
+            reason: "test_start"
+        )
+
+        let stopTask = Task {
+            await controller.stop(
+                retainPrepared: true,
+                reason: "cancelled_waiter"
+            )
+        }
+        stopTask.cancel()
+        let report = await stopTask.value
+
+        XCTAssertEqual(report.status, noErr)
+        XCTAssertTrue(report.retainedPreparedCapture)
+        XCTAssertEqual(controller.snapshot.phase, .prepared)
+        XCTAssertEqual(recorder.events, ["make:48000", "start:48000", "stop:48000"])
+        await controller.shutdown(reason: "test_complete")
+    }
+
+    func testSequentialStopStartReusesInputOnlyAfterStopCompletes() async throws {
+        let fingerprint = makeFingerprint(sampleRate: 48_000, bufferFrameSize: 512)
+        let recorder = DirectAudioEventRecorder(operationDelayMicroseconds: 2000)
+        let factory = FakeDirectAudioInputFactory(
+            fingerprints: [fingerprint],
+            recorder: recorder
+        )
+        let controller = DirectCoreAudioLifecycleController(
+            packetHandler: { _, _, _, _, _ in },
+            inputFactory: { deviceID, _ in
+                try factory.make(deviceID: deviceID)
+            },
+            fingerprintReader: { _ in fingerprint },
+            installsHardwareListeners: false,
+            onFormatInvalidated: { _ in }
+        )
+        _ = try await controller.start(
+            deviceID: fingerprint.deviceID,
+            deviceName: "Test microphone",
+            reason: "first_start"
+        )
+
+        _ = await controller.stop(retainPrepared: true, reason: "first_stop")
+        _ = try await controller.start(
+            deviceID: fingerprint.deviceID,
+            deviceName: "Test microphone",
+            reason: "second_start"
+        )
+        _ = await controller.stop(retainPrepared: true, reason: "second_stop")
+
+        XCTAssertEqual(controller.snapshot.phase, .prepared)
+        XCTAssertEqual(
+            recorder.events,
+            ["make:48000", "start:48000", "stop:48000", "start:48000", "stop:48000"]
+        )
+        XCTAssertEqual(recorder.maximumConcurrentOperations, 1)
+        await controller.shutdown(reason: "test_complete")
     }
 
     func testFailedStopPoisonsLifecycleAndPreventsReplacement() async throws {

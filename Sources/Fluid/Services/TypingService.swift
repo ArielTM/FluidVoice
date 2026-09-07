@@ -131,69 +131,28 @@ final class TypingService {
 
     // MARK: - Layout-aware key code lookup
 
-    /// Returns the virtual key code that produces `character` under the current keyboard layout.
-    /// Uses the TIS (Text Input Services) API which must run on the main thread, so the lookup
-    /// is dispatched there when called from a background thread. Falls back to `qwertyFallback`
-    /// if the layout data is unavailable.
-    private static func virtualKeyCode(for character: Character, qwertyFallback: CGKeyCode) -> CGKeyCode {
-        if Thread.isMainThread {
-            return self.tisLookup(for: character, qwertyFallback: qwertyFallback)
-        }
-        var result = qwertyFallback
-        DispatchQueue.main.sync {
-            result = self.tisLookup(for: character, qwertyFallback: qwertyFallback)
-        }
-        return result
+    private static let pasteKeyCache = PasteKeyCodeCache {
+        let key = PasteKeyCodeResolver.current()
+        DebugLogger.shared.benchmark("TYPING_BENCH", message: "paste_key_cache_refresh keyCode=\(key)", source: "TypingBenchmark")
+        return key
     }
 
-    /// Performs the actual TIS + UCKeyTranslate scan. Must be called on the main thread.
-    private static func tisLookup(for character: Character, qwertyFallback: CGKeyCode) -> CGKeyCode {
-        guard let targetScalar = character.unicodeScalars.first else { return qwertyFallback }
-
-        guard let sourceRef = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-              let rawPtr = TISGetInputSourceProperty(sourceRef, kTISPropertyUnicodeKeyLayoutData)
-        else {
-            return qwertyFallback
-        }
-        let layoutData = Unmanaged<CFData>.fromOpaque(rawPtr).takeUnretainedValue() as Data
-
-        return layoutData.withUnsafeBytes { buffer -> CGKeyCode in
-            guard let layoutPtr = buffer.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else {
-                return qwertyFallback
-            }
-            var deadKeyState: UInt32 = 0
-            var chars = [UniChar](repeating: 0, count: 4)
-            var length = 0
-            let kbType = UInt32(LMGetKbdType())
-
-            for keyCode: UInt16 in 0..<128 {
-                deadKeyState = 0
-                length = 0
-                let status = UCKeyTranslate(
-                    layoutPtr,
-                    keyCode,
-                    UInt16(kUCKeyActionDisplay),
-                    0,
-                    kbType,
-                    UInt32(kUCKeyTranslateNoDeadKeysMask),
-                    &deadKeyState,
-                    chars.count,
-                    &length,
-                    &chars
-                )
-                guard status == noErr, length > 0 else { continue }
-                if Unicode.Scalar(chars[0]) == targetScalar {
-                    return CGKeyCode(keyCode)
-                }
-            }
-            return qwertyFallback
-        }
+    /// Called during application launch, before any paste requests can arrive.
+    static func startKeyboardLayoutTracking() {
+        self.pasteKeyCache.start()
     }
 
     /// The virtual key code for "v" in the current keyboard layout (used for Cmd+V paste).
-    /// Re-evaluated on every call so runtime keyboard layout switches are picked up immediately.
+    /// Refreshed by the input-source notification, never by a background paste request.
     private static var pasteVirtualKeyCode: CGKeyCode {
-        virtualKeyCode(for: "v", qwertyFallback: 9)
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let key = self.pasteKeyCache.snapshot()
+        DebugLogger.shared.benchmark(
+            "TYPING_BENCH",
+            message: "paste_key_lookup queueMs=0 lookupMs=\((ProcessInfo.processInfo.systemUptime - startedAt) * 1000) returnMs=0 cached=true keyCode=\(key)",
+            source: "TypingBenchmark"
+        )
+        return key
     }
 
     // MARK: - Focus helpers (shared)
@@ -423,7 +382,7 @@ final class TypingService {
         tracksDictionaryCorrections: Bool = false,
         postInsertionKey: SettingsStore.SpokenSendKey? = nil,
         requiredFocusTarget: CapturedFocusTarget? = nil,
-        completion: ((DeliveryOutcome) -> Void)? = nil
+        completion: (@MainActor (DeliveryOutcome) -> Void)? = nil
     ) {
         let requestedAt = ProcessInfo.processInfo.systemUptime
         let text = plan.plainText
@@ -468,96 +427,110 @@ final class TypingService {
         self.log("[TypingService] Accessibility check passed, proceeding with text injection")
         self.isCurrentlyTyping = true
 
+        let pipelineID = DebugLogger.pipelineID
         DispatchQueue.global(qos: .userInitiated).async {
-            var outcome: DeliveryOutcome = .insertionFailed
-            let workerStartedAt = ProcessInfo.processInfo.systemUptime
-            self.bench("worker_start queueDelayMs=\(Self.elapsedMs(from: requestedAt, to: workerStartedAt))")
+            DebugLogger.$pipelineID.withValue(pipelineID) {
+                var outcome: DeliveryOutcome = .insertionFailed
+                let workerStartedAt = ProcessInfo.processInfo.systemUptime
+                self.bench("worker_start queueDelayMs=\(Self.elapsedMs(from: requestedAt, to: workerStartedAt))")
 
-            defer {
-                let completedAt = ProcessInfo.processInfo.systemUptime
-                self.isCurrentlyTyping = false
-                self.bench(
-                    "complete totalMs=\(Self.elapsedMs(from: requestedAt, to: completedAt)) textReadyToCompleteMs=\(textReadyAt.map { String(Self.elapsedMs(from: $0, to: completedAt)) } ?? "nil")"
-                )
-                self.log("[TypingService] Typing operation completed, isCurrentlyTyping set to false")
-                completion?(outcome)
-            }
+                defer {
+                    let completedAt = ProcessInfo.processInfo.systemUptime
+                    self.isCurrentlyTyping = false
+                    self.bench(
+                        "complete totalMs=\(Self.elapsedMs(from: requestedAt, to: completedAt)) textReadyToCompleteMs=\(textReadyAt.map { String(Self.elapsedMs(from: $0, to: completedAt)) } ?? "nil")"
+                    )
+                    self.log("[TypingService] Typing operation completed, isCurrentlyTyping set to false")
+                    let completedOutcome = outcome
+                    Task { @MainActor in
+                        self.bench(
+                            "delivery_main_begin queueMs=\(Self.elapsedMs(from: completedAt, to: ProcessInfo.processInfo.systemUptime))"
+                        )
+                        // Delivery UI must finish before correction tracking performs
+                        // any synchronous Accessibility queries on the main thread.
+                        completion?(completedOutcome)
+                        self.bench("delivery_main_callback_return")
+                        if tracksDictionaryCorrections,
+                           postInsertionKey == nil,
+                           completedOutcome.didInsert
+                        {
+                            AutomaticDictionaryCorrectionTracker.shared.beginObservingInsertion(
+                                text,
+                                targetPID: preferredTargetPID
+                            )
+                            self.bench("dictionary_tracking_scheduled afterDeliveryCallback=true")
+                        }
+                    }
+                }
 
-            self.log("[TypingService] Starting async text insertion process")
-            if settleDelayMs > 0 {
-                usleep(useconds_t(settleDelayMs * 1000))
-            }
-            self.bench("settle_delay_done delayMs=\(settleDelayMs) elapsedMs=\(Self.elapsedMs(since: requestedAt))")
-            let hasTextToInsert = !text.isEmpty
-            if postInsertionKey != nil {
+                self.log("[TypingService] Starting async text insertion process")
+                if settleDelayMs > 0 {
+                    usleep(useconds_t(settleDelayMs * 1000))
+                }
+                self.bench("settle_delay_done delayMs=\(settleDelayMs) elapsedMs=\(Self.elapsedMs(since: requestedAt))")
+                let hasTextToInsert = !text.isEmpty
+                if postInsertionKey != nil {
+                    guard let preferredTargetPID, let requiredFocusTarget else {
+                        outcome = .actionSuppressed
+                        return
+                    }
+                    // A held dictation modifier must suppress only the key action,
+                    // not the dictated text. The longer check below waits for
+                    // modifiers after insertion before deciding whether to send.
+                    guard Self.canInsertBeforePostInsertionAction(
+                        preferredTargetPID: preferredTargetPID,
+                        requiredTargetPID: requiredFocusTarget.pid,
+                        isSecureTextField: requiredFocusTarget.isSecureTextField,
+                        exactFocusIsActive: Self.isExactFocusTargetActive(requiredFocusTarget)
+                    ) else {
+                        outcome = .actionSuppressed
+                        return
+                    }
+                }
+
+                if hasTextToInsert {
+                    self.log("[TypingService] Delay completed, calling insertTextInstantly")
+                    let insertStartedAt = ProcessInfo.processInfo.systemUptime
+                    self.bench("insert_call")
+                    let inserted = self.insertTextInstantly(text, preferredTargetPID: preferredTargetPID)
+                    self.bench(
+                        "insert_return elapsedMs=\(Self.elapsedMs(since: insertStartedAt)) totalMs=\(Self.elapsedMs(since: requestedAt))"
+                    )
+                    guard inserted else {
+                        outcome = .insertionFailed
+                        return
+                    }
+
+                    outcome = .inserted
+                }
+
+                guard let postInsertionKey else { return }
                 guard let preferredTargetPID, let requiredFocusTarget else {
-                    outcome = .actionSuppressed
+                    outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
                     return
                 }
-                // A held dictation modifier must suppress only the key action,
-                // not the dictated text. The longer check below waits for
-                // modifiers after insertion before deciding whether to send.
-                guard Self.canInsertBeforePostInsertionAction(
+                let modifiersReleased = self.waitForPhysicalModifiersToRelease(timeout: 2)
+                let exactFocusIsActive = Self.isExactFocusTargetActive(requiredFocusTarget)
+                guard Self.canDispatchPostInsertionAction(
                     preferredTargetPID: preferredTargetPID,
                     requiredTargetPID: requiredFocusTarget.pid,
                     isSecureTextField: requiredFocusTarget.isSecureTextField,
-                    exactFocusIsActive: Self.isExactFocusTargetActive(requiredFocusTarget)
+                    modifiersReleased: modifiersReleased,
+                    exactFocusIsActive: exactFocusIsActive
                 ) else {
-                    outcome = .actionSuppressed
-                    return
-                }
-            }
-
-            if hasTextToInsert {
-                self.log("[TypingService] Delay completed, calling insertTextInstantly")
-                let insertStartedAt = ProcessInfo.processInfo.systemUptime
-                self.bench("insert_call")
-                let inserted = self.insertTextInstantly(text, preferredTargetPID: preferredTargetPID)
-                self.bench(
-                    "insert_return elapsedMs=\(Self.elapsedMs(since: insertStartedAt)) totalMs=\(Self.elapsedMs(since: requestedAt))"
-                )
-                guard inserted else {
-                    outcome = .insertionFailed
+                    outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
                     return
                 }
 
-                outcome = .inserted
-                if tracksDictionaryCorrections, postInsertionKey == nil {
-                    Task { @MainActor in
-                        AutomaticDictionaryCorrectionTracker.shared.beginObservingInsertion(
-                            text,
-                            targetPID: preferredTargetPID
-                        )
-                    }
+                usleep(50_000)
+                guard Self.isExactFocusTargetActive(requiredFocusTarget),
+                      self.postReturnKey(postInsertionKey, targetPID: preferredTargetPID)
+                else {
+                    outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
+                    return
                 }
+                outcome = hasTextToInsert ? .insertedAndActionDispatched : .actionDispatched
             }
-
-            guard let postInsertionKey else { return }
-            guard let preferredTargetPID, let requiredFocusTarget else {
-                outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
-                return
-            }
-            let modifiersReleased = self.waitForPhysicalModifiersToRelease(timeout: 2)
-            let exactFocusIsActive = Self.isExactFocusTargetActive(requiredFocusTarget)
-            guard Self.canDispatchPostInsertionAction(
-                preferredTargetPID: preferredTargetPID,
-                requiredTargetPID: requiredFocusTarget.pid,
-                isSecureTextField: requiredFocusTarget.isSecureTextField,
-                modifiersReleased: modifiersReleased,
-                exactFocusIsActive: exactFocusIsActive
-            ) else {
-                outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
-                return
-            }
-
-            usleep(50_000)
-            guard Self.isExactFocusTargetActive(requiredFocusTarget),
-                  self.postReturnKey(postInsertionKey, targetPID: preferredTargetPID)
-            else {
-                outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
-                return
-            }
-            outcome = hasTextToInsert ? .insertedAndActionDispatched : .actionDispatched
         }
     }
 
@@ -783,6 +756,10 @@ final class TypingService {
 
     private static func logFocusState(_ prefix: String) {
         guard self.isLoggingEnabled else { return }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        defer {
+            DebugLogger.shared.info("TYPING_BENCH t=\(ProcessInfo.processInfo.systemUptime) focus_debug_query elapsedMs=\(Self.elapsedMs(since: startedAt))", source: "TypingBenchmark")
+        }
         DebugLogger.shared.debug("\(prefix) | \(self.currentFocusDebugDescription())", source: "TypingService")
     }
 
@@ -858,7 +835,9 @@ final class TypingService {
         restoreDelayMicros: useconds_t,
         action: () -> Bool
     ) -> Bool {
+        let pasteboardWaitStartedAt = ProcessInfo.processInfo.systemUptime
         Self.pasteboardSessionSemaphore.wait()
+        self.bench("pasteboard_lock_acquired elapsedMs=\(Self.elapsedMs(since: pasteboardWaitStartedAt))")
         var releasesPasteboardSessionOnReturn = true
         defer {
             if releasesPasteboardSessionOnReturn {
@@ -867,8 +846,11 @@ final class TypingService {
         }
 
         let pasteboard = NSPasteboard.general
+        let snapshotStartedAt = ProcessInfo.processInfo.systemUptime
         let snapshot = self.capturePasteboardSnapshot(pasteboard)
+        self.bench("pasteboard_snapshot_done elapsedMs=\(Self.elapsedMs(since: snapshotStartedAt)) items=\(snapshot.items.count)")
 
+        let writeStartedAt = ProcessInfo.processInfo.systemUptime
         pasteboard.clearContents()
         guard pasteboard.writeObjects([Self.makeTransientPasteboardItem(text)]) else {
             self.log("[TypingService] ERROR: Failed to set temporary clipboard string")
@@ -876,8 +858,13 @@ final class TypingService {
             return false
         }
         let temporaryChangeCount = pasteboard.changeCount
+        self.bench("pasteboard_write_done elapsedMs=\(Self.elapsedMs(since: writeStartedAt))")
+        let focusSnapshotStartedAt = ProcessInfo.processInfo.systemUptime
         let focusedTextSnapshot = self.captureFocusedTextSnapshot()
+        self.bench("paste_focus_snapshot_done elapsedMs=\(Self.elapsedMs(since: focusSnapshotStartedAt))")
+        let actionStartedAt = ProcessInfo.processInfo.systemUptime
         let actionResult = action()
+        self.bench("paste_dispatch_done elapsedMs=\(Self.elapsedMs(since: actionStartedAt)) success=\(actionResult)")
         guard actionResult else {
             self.restorePasteboardSnapshot(snapshot, to: pasteboard)
             self.log("[TypingService] Restored previous clipboard snapshot after paste dispatch failure")
@@ -916,16 +903,21 @@ final class TypingService {
             return false
         }
 
+        let targetStartedAt = ProcessInfo.processInfo.systemUptime
         if activateTargetFirst, NSWorkspace.shared.frontmostApplication?.processIdentifier != targetPID {
             _ = Self.activateApp(pid: targetPID)
             usleep(80_000)
         }
+        self.bench("paste_target_prepared elapsedMs=\(Self.elapsedMs(since: targetStartedAt))")
 
         return self.withTemporaryPasteboardString(text, restoreDelayMicros: 5_000_000) {
+            let dispatchStartedAt = ProcessInfo.processInfo.systemUptime
             let vKey = Self.pasteVirtualKeyCode
+            let keyResolvedAt = ProcessInfo.processInfo.systemUptime
             guard let cmdVDown = CGEvent(keyboardEventSource: nil, virtualKey: vKey, keyDown: true),
                   let cmdVUp = CGEvent(keyboardEventSource: nil, virtualKey: vKey, keyDown: false)
             else {
+                self.bench("paste_dispatch_failed route=pid stage=event_creation elapsedMs=\(Self.elapsedMs(since: keyResolvedAt))")
                 self.log("[TypingService] ERROR: Failed to create Cmd+V events for PID insertion")
                 return false
             }
@@ -933,9 +925,19 @@ final class TypingService {
             cmdVDown.flags = .maskCommand
             cmdVUp.flags = .maskCommand
 
+            let eventsCreatedAt = ProcessInfo.processInfo.systemUptime
             cmdVDown.postToPid(targetPID)
+            let keyDownFinishedAt = ProcessInfo.processInfo.systemUptime
             usleep(10_000)
+            let waitFinishedAt = ProcessInfo.processInfo.systemUptime
             cmdVUp.postToPid(targetPID)
+            let keyUpFinishedAt = ProcessInfo.processInfo.systemUptime
+            self.bench(
+                "paste_dispatch_phases route=pid keyLookupMs=\((keyResolvedAt - dispatchStartedAt) * 1000) " +
+                    "eventCreateMs=\((eventsCreatedAt - keyResolvedAt) * 1000) keyDownMs=\((keyDownFinishedAt - eventsCreatedAt) * 1000) " +
+                    "sleepMs=\((waitFinishedAt - keyDownFinishedAt) * 1000) keyUpMs=\((keyUpFinishedAt - waitFinishedAt) * 1000) " +
+                    "totalMs=\((keyUpFinishedAt - dispatchStartedAt) * 1000)"
+            )
             self.log("[TypingService] Cmd+V posted to PID \(targetPID)")
             return true
         }
@@ -1034,10 +1036,13 @@ final class TypingService {
     private func insertTextViaClipboard(_ text: String) -> Bool {
         self.log("[TypingService] Starting clipboard-based insertion")
         return self.withTemporaryPasteboardString(text, restoreDelayMicros: 5_000_000) {
+            let dispatchStartedAt = ProcessInfo.processInfo.systemUptime
             let vKey = Self.pasteVirtualKeyCode
+            let keyResolvedAt = ProcessInfo.processInfo.systemUptime
             guard let cmdVDown = CGEvent(keyboardEventSource: nil, virtualKey: vKey, keyDown: true),
                   let cmdVUp = CGEvent(keyboardEventSource: nil, virtualKey: vKey, keyDown: false)
             else {
+                self.bench("paste_dispatch_failed route=global stage=event_creation elapsedMs=\(Self.elapsedMs(since: keyResolvedAt))")
                 self.log("[TypingService] ERROR: Failed to create Cmd+V events")
                 return false
             }
@@ -1045,9 +1050,19 @@ final class TypingService {
             cmdVDown.flags = .maskCommand
             cmdVUp.flags = .maskCommand
 
+            let eventsCreatedAt = ProcessInfo.processInfo.systemUptime
             cmdVDown.post(tap: .cghidEventTap)
+            let keyDownFinishedAt = ProcessInfo.processInfo.systemUptime
             usleep(10_000)
+            let waitFinishedAt = ProcessInfo.processInfo.systemUptime
             cmdVUp.post(tap: .cghidEventTap)
+            let keyUpFinishedAt = ProcessInfo.processInfo.systemUptime
+            self.bench(
+                "paste_dispatch_phases route=global keyLookupMs=\((keyResolvedAt - dispatchStartedAt) * 1000) " +
+                    "eventCreateMs=\((eventsCreatedAt - keyResolvedAt) * 1000) keyDownMs=\((keyDownFinishedAt - eventsCreatedAt) * 1000) " +
+                    "sleepMs=\((waitFinishedAt - keyDownFinishedAt) * 1000) keyUpMs=\((keyUpFinishedAt - waitFinishedAt) * 1000) " +
+                    "totalMs=\((keyUpFinishedAt - dispatchStartedAt) * 1000)"
+            )
             self.log("[TypingService] Cmd+V sent via clipboard insertion")
             return true
         }

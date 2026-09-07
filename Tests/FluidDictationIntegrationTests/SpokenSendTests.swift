@@ -377,7 +377,7 @@ final class SpokenSendTests: XCTestCase {
     }
 
     @MainActor
-    func testSettingsBackupIncludesSpokenSendConfiguration() async {
+    func testSettingsBackupIncludesSpokenSendConfiguration() async throws {
         let settings = SettingsStore.shared
         let originalEnabled = settings.spokenSendEnabled
         let originalImmediate = settings.spokenSendImmediatelyEnabled
@@ -395,7 +395,7 @@ final class SpokenSendTests: XCTestCase {
         settings.spokenSendPhrase = "ship it"
         settings.spokenSendKey = .commandEnter
 
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         XCTAssertEqual(document.settings.spokenSendEnabled, true)
         XCTAssertEqual(document.settings.spokenSendImmediatelyEnabled, false)
         XCTAssertEqual(document.settings.spokenSendPhrase, "ship it")

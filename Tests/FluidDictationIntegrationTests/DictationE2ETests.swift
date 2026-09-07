@@ -2823,7 +2823,7 @@ extension DictationE2ETests {
         ]
         settings.spokenFormattingActionRules = backedUpRules
 
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         let encoded = try BackupService.shared.encode(document)
         let decoded = try BackupService.shared.decode(encoded)
         XCTAssertEqual(decoded.settings.spokenFormattingActionRules, settings.spokenFormattingActionRules)
@@ -2854,6 +2854,36 @@ extension DictationE2ETests {
 
 @MainActor
 final class OverlayFailureStateTests: XCTestCase {
+    func testAIFailurePresentationOnlyRunsForPersistedFallbackOutput() {
+        XCTAssertTrue(
+            DictationAIFailurePresentationPolicy.shouldPresent(
+                shouldPersistOutputs: true,
+                fallbackReason: "offline"
+            )
+        )
+        XCTAssertFalse(
+            DictationAIFailurePresentationPolicy.shouldPresent(
+                shouldPersistOutputs: false,
+                fallbackReason: "offline"
+            ),
+            "Onboarding sandbox failures must not create retry UI or system notifications"
+        )
+        XCTAssertFalse(
+            DictationAIFailurePresentationPolicy.shouldPresent(
+                shouldPersistOutputs: true,
+                fallbackReason: nil
+            )
+        )
+    }
+
+    func testConfigurationFailureNotificationPointsToProviderSetup() {
+        let message = DictationAIFailurePresentationPolicy.notificationMessage(
+            for: AIProcessingError.missingAPIKey(provider: "OpenAI")
+        )
+
+        XCTAssertEqual(message, "API key not set for OpenAI. Open AI Providers to configure a provider.")
+    }
+
     func testCustomNonRetryableMessage() {
         let state = NotchContentState.shared
         defer {
@@ -2874,6 +2904,40 @@ final class OverlayFailureStateTests: XCTestCase {
 
         XCTAssertEqual(state.aiProcessingFailureMessage, "AI Enhancement failed")
         XCTAssertTrue(state.canRetryAIProcessingFailure)
+    }
+}
+
+final class AudioBudgetMeasurementGateTests: XCTestCase {
+    func testMeasurementRequiresMatchingRevisionAndBudget() {
+        let gate = AudioBudgetMeasurementGate(revision: 7, budgetBytes: 1_000)
+
+        XCTAssertTrue(gate.accepts(currentRevision: 7, currentBudgetBytes: 1_000))
+        XCTAssertFalse(gate.accepts(currentRevision: 8, currentBudgetBytes: 1_000))
+        XCTAssertFalse(gate.accepts(currentRevision: 7, currentBudgetBytes: 2_000))
+    }
+
+    func testPendingOrReferencedAudioIsNeverDeletedAsOrphan() {
+        XCTAssertFalse(
+            DictationAudioHistoryStore.shouldDeleteUnreferencedAudioFile(
+                fileName: "pending.wav",
+                referencedFileNames: [],
+                pendingFileNames: ["pending.wav"]
+            )
+        )
+        XCTAssertFalse(
+            DictationAudioHistoryStore.shouldDeleteUnreferencedAudioFile(
+                fileName: "saved.wav",
+                referencedFileNames: ["saved.wav"],
+                pendingFileNames: []
+            )
+        )
+        XCTAssertTrue(
+            DictationAudioHistoryStore.shouldDeleteUnreferencedAudioFile(
+                fileName: "orphan.wav",
+                referencedFileNames: [],
+                pendingFileNames: []
+            )
+        )
     }
 }
 

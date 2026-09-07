@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Error Types
 
-enum LLMError: Error, LocalizedError {
+nonisolated enum LLMError: Error, LocalizedError, @unchecked Sendable {
     case invalidURL
     case invalidResponse
     case httpError(Int, String)
@@ -58,8 +58,9 @@ enum LLMError: Error, LocalizedError {
 
 /// Unified LLM communication layer for all modes (Transcription, Command, Rewrite).
 /// Handles HTTP requests, SSE streaming, thinking token extraction, and tool call parsing.
-@MainActor
-final class LLMClient {
+/// Stateless, thread-safe transport. Keeping streaming decode off MainActor prevents
+/// provider token bursts from delaying dictation UI and final text delivery.
+final nonisolated class LLMClient: @unchecked Sendable {
     static let shared = LLMClient()
 
     /// Default timeout for LLM requests (30 seconds)
@@ -82,7 +83,7 @@ final class LLMClient {
 
     // MARK: - Response Types
 
-    struct Response {
+    struct Response: @unchecked Sendable {
         /// Extracted <think>...</think> content (nil if none)
         let thinking: String?
         /// Main response content with thinking tags stripped
@@ -91,7 +92,7 @@ final class LLMClient {
         let toolCalls: [ToolCall]
     }
 
-    struct ToolCall {
+    struct ToolCall: @unchecked Sendable {
         let id: String
         let name: String
         let arguments: [String: Any]
@@ -117,7 +118,7 @@ final class LLMClient {
 
     // MARK: - Configuration
 
-    struct Config {
+    struct Config: @unchecked Sendable {
         let messages: [[String: Any]]
         let model: String
         let baseURL: String
@@ -133,6 +134,9 @@ final class LLMClient {
         /// These are model-specific and come from user settings
         var extraParameters: [String: Any]
 
+        /// Optional dictation pipeline correlation for bounded latency diagnostics.
+        let benchmarkID: String?
+
         // Retry configuration
         var maxRetries: Int = 3
         var retryDelayMs: Int = 200
@@ -141,11 +145,11 @@ final class LLMClient {
         var timeoutSeconds: TimeInterval?
 
         // Optional real-time callbacks (for streaming UI updates)
-        var onThinkingStart: (() -> Void)?
-        var onThinkingChunk: ((String) -> Void)?
-        var onThinkingEnd: (() -> Void)?
-        var onContentChunk: ((String) -> Void)?
-        var onToolCallStart: ((String) -> Void)?
+        var onThinkingStart: (@Sendable () -> Void)?
+        var onThinkingChunk: (@Sendable (String) -> Void)?
+        var onThinkingEnd: (@Sendable () -> Void)?
+        var onContentChunk: (@Sendable (String) -> Void)?
+        var onToolCallStart: (@Sendable (String) -> Void)?
 
         init(
             messages: [[String: Any]],
@@ -156,7 +160,8 @@ final class LLMClient {
             tools: [[String: Any]] = [],
             temperature: Double? = nil,
             maxTokens: Int? = nil,
-            extraParameters: [String: Any] = [:]
+            extraParameters: [String: Any] = [:],
+            benchmarkID: String? = nil
         ) {
             self.messages = messages
             self.model = model
@@ -167,6 +172,7 @@ final class LLMClient {
             self.temperature = temperature
             self.maxTokens = maxTokens
             self.extraParameters = extraParameters
+            self.benchmarkID = benchmarkID
         }
     }
 
@@ -175,20 +181,27 @@ final class LLMClient {
     /// Make an LLM API call with the given configuration.
     /// Supports both streaming and non-streaming modes.
     /// Handles thinking token extraction, tool call parsing, and retries.
-    func call(_ config: Config) async throws -> Response {
+    @concurrent func call(_ config: Config) async throws -> Response {
+        self.benchmark(config, "call_enter")
         var request = try buildRequest(config)
+        self.benchmark(config, "request_built bodyBytes=\(request.httpBody?.count ?? 0)")
 
         // Apply timeout to the request itself
         let timeout = config.timeoutSeconds ?? Self.defaultTimeoutSeconds
         request.timeoutInterval = timeout
 
-        self.logRequest(request)
-
         // Execute the request. We rely on URLRequest/URLSession timeouts (30s default) rather
         // than racing a separate "timeout task". A task-group timeout wrapper can accidentally
         // keep the caller suspended until the full timeout elapses, which is the exact stall
         // we want to eliminate for overlay responsiveness.
-        return try await self.executeWithRetry(request: request, config: config)
+        do {
+            let response = try await self.executeWithRetry(request: request, config: config)
+            self.benchmark(config, "call_return")
+            return response
+        } catch {
+            self.benchmark(config, "call_fail")
+            throw error
+        }
     }
 
     /// Execute request with retry logic (extracted for timeout wrapper)
@@ -196,13 +209,14 @@ final class LLMClient {
         var lastError: Error?
         for attempt in 1...config.maxRetries {
             do {
+                self.benchmark(config, "attempt_start attempt=\(attempt)")
                 if config.streaming {
                     if self.isResponsesRequest(request) {
                         return try await self.processResponsesStreaming(request: request, config: config)
                     }
                     return try await self.processStreaming(request: request, config: config)
                 } else {
-                    return try await self.processNonStreaming(request: request)
+                    return try await self.processNonStreaming(request: request, config: config)
                 }
             } catch let error as URLError where self.isRetryableError(error) {
                 lastError = LLMError.networkError(error)
@@ -249,13 +263,6 @@ final class LLMClient {
             throw LLMError.encodingError
         }
 
-        // Log the request for debugging
-        let messageCount = config.messages.count
-        if let bodyStr = String(data: jsonData, encoding: .utf8) {
-            let truncated = bodyStr.count > 500 ? String(bodyStr.prefix(500)) + "..." : bodyStr
-            DebugLogger.shared.debug("LLMClient: Request (\(messageCount) messages, model=\(config.model), streaming=\(config.streaming)): \(truncated)", source: "LLMClient")
-        }
-
         // Build URLRequest
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -267,6 +274,12 @@ final class LLMClient {
         }
 
         request.httpBody = jsonData
+
+        DebugLogger.shared.debug(
+            "LLMClient: Request ready url=\(endpoint) messages=\(config.messages.count) "
+                + "model=\(config.model) streaming=\(config.streaming) bodyBytes=\(jsonData.count)",
+            source: "LLMClient"
+        )
 
         return request
     }
@@ -348,7 +361,7 @@ final class LLMClient {
 
         // Final Layer: Common parameters with model-specific keys
         if let tokens = config.maxTokens {
-            if SettingsStore.shared.isReasoningModel(config.model) {
+            if Self.usesReasoningCompletionTokenParameter(config.model) {
                 body["max_completion_tokens"] = tokens
             } else {
                 body["max_tokens"] = tokens
@@ -356,6 +369,20 @@ final class LLMClient {
         }
 
         return body
+    }
+
+    private static func usesReasoningCompletionTokenParameter(_ model: String) -> Bool {
+        var modelLower = model.lowercased()
+        if let slash = modelLower.firstIndex(of: "/") {
+            modelLower = String(modelLower[modelLower.index(after: slash)...])
+        }
+        return modelLower.hasPrefix("gpt-5") ||
+            modelLower.contains("gpt-5.") ||
+            modelLower.hasPrefix("o1") ||
+            modelLower.hasPrefix("o3") ||
+            modelLower.hasPrefix("o4") ||
+            modelLower.contains("gpt-oss") ||
+            (modelLower.contains("deepseek") && modelLower.contains("reasoner"))
     }
 
     func buildResponsesBody(_ config: Config) -> [String: Any] {
@@ -467,10 +494,11 @@ final class LLMClient {
 
     // MARK: - Non-Streaming Response
 
-    private func processNonStreaming(request: URLRequest) async throws -> Response {
+    private func processNonStreaming(request: URLRequest, config: Config) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Making non-streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
         let (data, response) = try await self.session.data(for: request)
+        self.benchmark(config, "response_data bytes=\(data.count)")
 
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             let errText = String(data: data, encoding: .utf8) ?? "Unknown error"
@@ -484,22 +512,25 @@ final class LLMClient {
             throw LLMError.invalidResponse
         }
 
+        let parsed: Response
         if self.isResponsesRequest(request) {
-            return try self.parseResponsesResponse(json)
+            parsed = try self.parseResponsesResponse(json)
+        } else {
+            guard let choices = json["choices"] as? [[String: Any]],
+                  let choice = choices.first,
+                  let message = choice["message"] as? [String: Any]
+            else { throw LLMError.invalidResponse }
+            parsed = self.parseMessageResponse(message)
         }
-
-        guard let choices = json["choices"] as? [[String: Any]],
-              let choice = choices.first,
-              let message = choice["message"] as? [String: Any]
-        else { throw LLMError.invalidResponse }
-
-        return self.parseMessageResponse(message)
+        self.benchmark(config, "response_decoded")
+        return parsed
     }
 
     private func processResponsesStreaming(request: URLRequest, config: Config) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Starting Responses streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
         let (bytes, response) = try await self.session.bytes(for: request)
+        self.benchmark(config, "response_headers")
 
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             var errorData = Data()
@@ -512,6 +543,7 @@ final class LLMClient {
 
         var contentBuffer: [String] = []
         var toolCallsByIndex: [Int: ResponsesToolCallAccumulator] = [:]
+        var didLogFirstContent = false
 
         for try await rawLine in bytes.lines {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
@@ -535,6 +567,10 @@ final class LLMClient {
             switch type {
             case "response.output_text.delta":
                 if let delta = event["delta"] as? String {
+                    if !didLogFirstContent, !delta.isEmpty {
+                        didLogFirstContent = true
+                        self.benchmark(config, "first_content")
+                    }
                     contentBuffer.append(delta)
                     config.onContentChunk?(delta)
                 }
@@ -592,17 +628,20 @@ final class LLMClient {
             )
         }
 
-        return Response(
+        let parsed = Response(
             thinking: nil,
             content: contentBuffer.joined().trimmingCharacters(in: .whitespacesAndNewlines),
             toolCalls: toolCalls
         )
+        self.benchmark(config, "response_decoded")
+        return parsed
     }
 
     private func processStreaming(request: URLRequest, config: Config) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Starting streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
         let (bytes, response) = try await self.session.bytes(for: request)
+        self.benchmark(config, "response_headers")
 
         // Check for HTTP errors
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
@@ -623,6 +662,7 @@ final class LLMClient {
         var contentBuffer: [String] = []
         var tagDetectionBuffer = ""
         var usesSeparateReasoningFields = false
+        var didLogFirstContent = false
 
         // Tool call accumulation
         var toolCallId: String?
@@ -651,11 +691,12 @@ final class LLMClient {
                 continue
             }
 
-            // DEBUG LOG: Show full delta to see all fields (e.g., 'reasoning', 'thought', 'delta_reasoning', etc.)
-            if let deltaData = try? JSONSerialization.data(withJSONObject: delta, options: [.fragmentsAllowed]),
-               let deltaString = String(data: deltaData, encoding: .utf8)
-            {
-                DebugLogger.shared.debug("LLMClient: Full Delta: \(deltaString)", source: "LLMClient")
+            // Preserve bounded raw diagnostics without re-serializing every token.
+            if thinkingBuffer.count + contentBuffer.count < 8 || delta["tool_calls"] != nil {
+                let rawDelta = jsonString
+                DebugLogger.shared.logLazy(level: .debug, source: "LLMClient") {
+                    "LLMClient: Full Delta: \(rawDelta)"
+                }
             }
 
             // Handle separate reasoning fields (OpenAI 'reasoning', 'reasoning_content', DeepSeek, etc.)
@@ -680,6 +721,10 @@ final class LLMClient {
                     if state == .inThinking {
                         state = .inContent
                         config.onThinkingEnd?()
+                    }
+                    if !didLogFirstContent, !content.isEmpty {
+                        didLogFirstContent = true
+                        self.benchmark(config, "first_content")
                     }
                     contentBuffer.append(content)
                     config.onContentChunk?(content)
@@ -725,6 +770,10 @@ final class LLMClient {
                         config.onThinkingChunk?(thinkChunk)
                     }
                     if !contentChunk.isEmpty {
+                        if !didLogFirstContent {
+                            didLogFirstContent = true
+                            self.benchmark(config, "first_content")
+                        }
                         contentBuffer.append(contentChunk)
                         config.onContentChunk?(contentChunk)
                     }
@@ -787,11 +836,13 @@ final class LLMClient {
 
         DebugLogger.shared.debug("LLMClient: Returning response. Content length: \(contentText.count), Has thinking: \(thinkingText.isEmpty ? "No" : "Yes (\(thinkingText.count) chars)")", source: "LLMClient")
 
-        return Response(
+        let parsed = Response(
             thinking: thinkingText.isEmpty ? nil : thinkingText,
             content: contentText,
             toolCalls: parsedToolCalls
         )
+        self.benchmark(config, "response_decoded")
+        return parsed
     }
 
     // MARK: - Parse Non-Streaming Message
@@ -1011,21 +1062,12 @@ final class LLMClient {
 
     // MARK: - Logging Helpers
 
-    private func logRequest(_ request: URLRequest) {
-        guard let url = request.url, let method = request.httpMethod else { return }
-
-        var bodyString = ""
-        if let body = request.httpBody {
-            bodyString = String(data: body, encoding: .utf8) ?? ""
-        }
-
-        var curl = "curl -X \(method) \"\(url.absoluteString)\" \\\n"
-        for (key, value) in request.allHTTPHeaderFields ?? [:] {
-            let maskedValue = key.lowercased().contains("auth") ? "Bearer [REDACTED]" : value
-            curl += "  -H \"\(key): \(maskedValue)\" \\\n"
-        }
-        curl += "  -d '\(bodyString)'"
-
-        DebugLogger.shared.info("LLMClient: Full Request as cURL:\n\(curl)", source: "LLMClient")
+    private func benchmark(_ config: Config, _ message: String) {
+        guard let id = config.benchmarkID else { return }
+        DebugLogger.shared.benchmark(
+            "LLM_BENCH",
+            message: "id=\(id) \(message)",
+            source: "LLMBenchmark"
+        )
     }
 }
