@@ -260,15 +260,17 @@ protocol PrivateAIIntegrationProviding: Sendable {
     func prewarmDictation() async
     func unloadCachedRuntime(reason: String) async
     func shutdownForTermination() async
-    func enhanceDictation(
-        _ inputText: String,
-        runtime: PrivateAIIntegrationService.RuntimeConfiguration,
-        context: PrivateAIIntegrationService.AppContext
-    ) async throws -> PrivateAIIntegrationService.EnhancementResult
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: PrivateAIIntegrationService.RuntimeConfiguration,
         context: PrivateAIIntegrationService.AppContext,
+        maxOutputTokens: Int
+    ) async throws -> PrivateAIIntegrationService.EnhancementResult
+    nonisolated func enhanceDictation(
+        _ inputText: String,
+        runtime: PrivateAIIntegrationService.RuntimeConfiguration,
+        context: PrivateAIIntegrationService.AppContext,
+        maxOutputTokens: Int,
         streamHandler: PrivateAIStreamHandler?
     ) async throws -> PrivateAIIntegrationService.EnhancementResult
     func rewrite(
@@ -318,13 +320,19 @@ extension PrivateAIIntegrationProviding {
         await self.unloadCachedRuntime(reason: "termination")
     }
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: PrivateAIIntegrationService.RuntimeConfiguration,
         context: PrivateAIIntegrationService.AppContext,
+        maxOutputTokens: Int,
         streamHandler _: PrivateAIStreamHandler?
     ) async throws -> PrivateAIIntegrationService.EnhancementResult {
-        try await self.enhanceDictation(inputText, runtime: runtime, context: context)
+        try await self.enhanceDictation(
+            inputText,
+            runtime: runtime,
+            context: context,
+            maxOutputTokens: maxOutputTokens
+        )
     }
 
     func rewrite(
@@ -509,10 +517,11 @@ private struct UnavailablePrivateAIIntegrationProvider: PrivateAIIntegrationProv
 
     func unloadCachedRuntime(reason _: String) async {}
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime _: PrivateAIIntegrationService.RuntimeConfiguration,
-        context _: PrivateAIIntegrationService.AppContext
+        context _: PrivateAIIntegrationService.AppContext,
+        maxOutputTokens _: Int
     ) async throws -> PrivateAIIntegrationService.EnhancementResult {
         PrivateAIIntegrationService.EnhancementResult(
             outputText: inputText,

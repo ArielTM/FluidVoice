@@ -190,8 +190,6 @@ final nonisolated class LLMClient: @unchecked Sendable {
         let timeout = config.timeoutSeconds ?? Self.defaultTimeoutSeconds
         request.timeoutInterval = timeout
 
-        self.logRequest(request)
-
         // Execute the request. We rely on URLRequest/URLSession timeouts (30s default) rather
         // than racing a separate "timeout task". A task-group timeout wrapper can accidentally
         // keep the caller suspended until the full timeout elapses, which is the exact stall
@@ -276,6 +274,12 @@ final nonisolated class LLMClient: @unchecked Sendable {
         }
 
         request.httpBody = jsonData
+
+        DebugLogger.shared.debug(
+            "LLMClient: Request ready url=\(endpoint) messages=\(config.messages.count) "
+                + "model=\(config.model) streaming=\(config.streaming) bodyBytes=\(jsonData.count)",
+            source: "LLMClient"
+        )
 
         return request
     }
@@ -1065,22 +1069,5 @@ final nonisolated class LLMClient: @unchecked Sendable {
             message: "id=\(id) \(message)",
             source: "LLMBenchmark"
         )
-    }
-
-    private func logRequest(_ request: URLRequest) {
-        guard let url = request.url, let method = request.httpMethod else { return }
-        let urlString = url.absoluteString
-        let headers = request.allHTTPHeaderFields ?? [:]
-        let body = request.httpBody
-        DebugLogger.shared.logLazy(level: .info, source: "LLMClient") {
-            let bodyString = body.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            var curl = "curl -X \(method) \"\(urlString)\" \\\n"
-            for (key, value) in headers {
-                let maskedValue = key.lowercased().contains("auth") ? "Bearer [REDACTED]" : value
-                curl += "  -H \"\(key): \(maskedValue)\" \\\n"
-            }
-            curl += "  -d '\(bodyString)'"
-            return "LLMClient: Full Request as cURL:\n\(curl)"
-        }
     }
 }

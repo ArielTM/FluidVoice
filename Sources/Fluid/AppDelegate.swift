@@ -146,6 +146,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        DispatchQueue.global(qos: .utility).async {
+            try? KeychainService.shared.refreshCachedKeys()
+        }
         if let deadline = self.analyticsActivationSuppressionDeadline, Date() <= deadline {
             self.analyticsActivationSuppressionDeadline = nil
         } else {

@@ -378,7 +378,8 @@ final class FluidAudioProvider: TranscriptionProvider {
                     samples: samples,
                     text: result.text,
                     startedAt: startedAt,
-                    usedFallback: false
+                    usedFallback: false,
+                    source: "incremental"
                 )
                 return result
             } catch {
@@ -447,16 +448,26 @@ final class FluidAudioProvider: TranscriptionProvider {
                 userInfo: [NSLocalizedDescriptionKey: "Incremental ASR session cannot finalize this recording"]
             )
         }
-        if samples.count > self.incrementalAcceptedSampleCount {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let acceptedBeforeFinal = self.incrementalAcceptedSampleCount
+        if samples.count > acceptedBeforeFinal {
             try await self.appendIncrementalSamples(samples, to: session)
         }
+        let appendFinishedAt = ProcessInfo.processInfo.systemUptime
         let result = try await session.finish(finalAudioSamples: samples)
-        let reusedWindows = await session.finalizedWindowCount
+        let finishFinishedAt = ProcessInfo.processInfo.systemUptime
         DebugLogger.shared.info(
-            "FluidAudioProvider: Incremental final reused \(reusedWindows) stable Parakeet windows",
-            source: "FluidAudioProvider"
+            "ASR_BENCH incremental_final_split acceptedBefore=\(acceptedBeforeFinal) " +
+                "appended=\(samples.count - acceptedBeforeFinal) " +
+                "appendMs=\(Self.milliseconds(from: startedAt, to: appendFinishedAt)) " +
+                "finishMs=\(Self.milliseconds(from: appendFinishedAt, to: finishFinishedAt))",
+            source: "ASRBenchmark"
         )
         return ASRTranscriptionResult(text: result.text, confidence: result.confidence)
+    }
+
+    private static func milliseconds(from start: TimeInterval, to end: TimeInterval) -> String {
+        String(format: "%.1f", (end - start) * 1000)
     }
 
     private func appendIncrementalSamples(

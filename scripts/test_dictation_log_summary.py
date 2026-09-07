@@ -140,6 +140,55 @@ class DictationLogSummaryTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["llm_return_hop_ms"], 1)
         self.assertIn("External AI handoff detail", render([result]))
 
+    def test_private_fi_summary_uses_low_overhead_completion_log(self):
+        result = self.parse(
+            row("APP_BENCH", 1, "begin_recording"),
+            row("APP_BENCH", 2, "pipeline_begin id=A"),
+            row("APP_BENCH", 2.100, "ai_process_call id=A provider=fluid-1 model=fluid-1 inputChars=40"),
+            "[12:00:00.000] [INFO] [PrivateAIProvider] Private provider post-processing complete "
+            "backend=FluidDecode model=fluid-1 setupMs=1 requestMs=31 returnMs=0 totalMs=30 "
+            "prefillMs=8 ttftMs=9 decodeMs=21",
+            row("APP_BENCH", 2.140, "ai_process_return id=A"),
+        )[0]
+
+        self.assertEqual(result["metrics"]["fi_setup_ms"], 1)
+        self.assertEqual(result["metrics"]["fi_request_ms"], 31)
+        self.assertEqual(result["metrics"]["fi_model_ms"], 30)
+        self.assertEqual(result["metrics"]["fi_prefill_ms"], 8)
+        self.assertEqual(result["metrics"]["fi_ttft_ms"], 9)
+        self.assertEqual(result["metrics"]["fi_decode_ms"], 21)
+        self.assertEqual(result["metrics"]["fi_return_ms"], 0)
+        self.assertEqual(result["metrics"]["fi_remaining_handoff_ms"], 8)
+        rendered = render([result])
+        self.assertIn("Private FI handoff", rendered)
+        self.assertIn("| 1.0 | 31.0 | 30.0 | 8.0 | 9.0 | 21.0 |", rendered)
+
+    def test_unrelated_private_api_result_does_not_attach_after_dictation_return(self):
+        result = self.parse(
+            row("APP_BENCH", 1, "begin_recording"),
+            row("APP_BENCH", 2, "pipeline_begin id=A"),
+            row("APP_BENCH", 2.100, "ai_process_call id=A provider=fluid-1 model=fluid-1 inputChars=40"),
+            row("APP_BENCH", 2.140, "ai_process_return id=A"),
+            "[12:00:01.000] [INFO] [PrivateAIProvider] Private provider post-processing complete "
+            "backend=FluidDecode model=fluid-1 setupMs=1 requestMs=31 returnMs=0 totalMs=30",
+        )[0]
+
+        self.assertIsNone(result["metrics"]["fi_request_ms"])
+
+    def test_concurrent_private_results_are_not_misattributed_to_dictation(self):
+        result = self.parse(
+            row("APP_BENCH", 1, "begin_recording"),
+            row("APP_BENCH", 2, "pipeline_begin id=A"),
+            row("APP_BENCH", 2.100, "ai_process_call id=A provider=fluid-1 model=fluid-1 inputChars=40"),
+            "[12:00:00.000] [INFO] [PrivateAIProvider] Private provider post-processing complete "
+            "backend=FluidDecode model=fluid-1 setupMs=1 requestMs=31 returnMs=0 totalMs=30",
+            "[12:00:00.010] [INFO] [PrivateAIProvider] Private provider post-processing complete "
+            "backend=FluidDecode model=fluid-1 setupMs=1 requestMs=41 returnMs=0 totalMs=40",
+            row("APP_BENCH", 2.150, "ai_process_return id=A"),
+        )[0]
+
+        self.assertIsNone(result["metrics"]["fi_request_ms"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -106,6 +106,7 @@ struct DictationProviderRoute: Equatable {
     static func resolve(settings: SettingsStore, providerID: String, model: String) -> Self {
         let trimmedProviderID = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let providerKeys = settings.providerAPIKeys
         if let saved = settings.savedProviders.first(where: { $0.id == trimmedProviderID }) {
             let key = "custom:\(saved.id)"
             return Self(
@@ -113,7 +114,7 @@ struct DictationProviderRoute: Equatable {
                 providerKey: key,
                 baseURL: saved.baseURL,
                 model: trimmedModel,
-                apiKey: settings.providerAPIKeys[key] ?? settings.providerAPIKeys[trimmedProviderID] ?? ""
+                apiKey: providerKeys[key] ?? providerKeys[trimmedProviderID] ?? ""
             )
         }
         return Self(
@@ -121,7 +122,7 @@ struct DictationProviderRoute: Equatable {
             providerKey: trimmedProviderID,
             baseURL: ModelRepository.shared.defaultBaseURL(for: trimmedProviderID),
             model: trimmedModel,
-            apiKey: settings.providerAPIKeys[trimmedProviderID] ?? ""
+            apiKey: providerKeys[trimmedProviderID] ?? ""
         )
     }
 

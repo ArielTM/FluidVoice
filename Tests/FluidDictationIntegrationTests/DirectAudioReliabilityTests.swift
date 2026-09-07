@@ -8,7 +8,7 @@ final class DirectAudioReliabilityTests: XCTestCase {
     @MainActor
     func testAIStreamPreviewCoalescesBurstIntoOneMainActorUpdate() async {
         var publishedText: [String] = []
-        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 0) { text in
+        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 0, initialUpdateDelay: 0) { text in
             publishedText.append(text)
         }
 
@@ -24,7 +24,7 @@ final class DirectAudioReliabilityTests: XCTestCase {
     @MainActor
     func testAIStreamPreviewFlushesShortGenerationWithoutQueuedUIWork() async {
         var publishedText: [String] = []
-        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 60) { text in
+        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 60, initialUpdateDelay: 60) { text in
             publishedText.append(text)
         }
 
@@ -36,6 +36,23 @@ final class DirectAudioReliabilityTests: XCTestCase {
         await Task.yield()
 
         XCTAssertEqual(publishedText, ["Exact output"])
+    }
+
+    @MainActor
+    func testAIStreamPreviewReturnsToNormalCadenceAfterStartupGrace() async {
+        var publishedText: [String] = []
+        let preview = DictationAIStreamPreviewBuffer(minimumUpdateInterval: 60, initialUpdateDelay: 0) { text in
+            publishedText.append(text)
+        }
+
+        preview.append("First")
+        await Task.yield()
+        preview.append(" second")
+        await Task.yield()
+
+        XCTAssertEqual(publishedText, ["First"])
+        preview.flush()
+        XCTAssertEqual(publishedText, ["First", "First second"])
     }
 
     @MainActor
@@ -67,6 +84,56 @@ final class DirectAudioReliabilityTests: XCTestCase {
         XCTAssertTrue(gate.finish())
         XCTAssertFalse(gate.isDeferring)
         XCTAssertFalse(gate.finish())
+    }
+
+    func testStopUIInvalidationGateWaitsForOutputPipelineHold() {
+        var gate = ASRStopUIInvalidationGate()
+
+        gate.holdForOutputPipeline()
+        gate.begin()
+
+        XCTAssertFalse(gate.finish())
+        XCTAssertTrue(gate.isDeferring)
+        XCTAssertTrue(gate.releaseOutputPipelineHold())
+        XCTAssertFalse(gate.isDeferring)
+        XCTAssertFalse(gate.releaseOutputPipelineHold())
+    }
+
+    func testStopUIInvalidationGateForceFinishBoundsHeldPipeline() {
+        var gate = ASRStopUIInvalidationGate()
+
+        gate.holdForOutputPipeline()
+        gate.begin()
+        XCTAssertFalse(gate.finish())
+
+        XCTAssertTrue(gate.forceFinish())
+        XCTAssertFalse(gate.isDeferring)
+        XCTAssertFalse(gate.forceFinish())
+    }
+
+    @MainActor
+    func testFinalTranscriptionStatusRunsAfterDelay() async {
+        var operationCount = 0
+        let task = scheduleDeferredMainActorOperation(afterNanoseconds: 0) {
+            operationCount += 1
+        }
+
+        await task.value
+
+        XCTAssertEqual(operationCount, 1)
+    }
+
+    @MainActor
+    func testCancelledFinalTranscriptionStatusHasNoSideEffect() async {
+        var operationCount = 0
+        let task = scheduleDeferredMainActorOperation(afterNanoseconds: 60_000_000_000) {
+            operationCount += 1
+        }
+
+        task.cancel()
+        await task.value
+
+        XCTAssertEqual(operationCount, 0)
     }
 
     @MainActor
@@ -510,6 +577,40 @@ final class DirectAudioReliabilityTests: XCTestCase {
         XCTAssertFalse(postStopSection.contains("updateTranscriptionText(\"\")"))
     }
 
+    func testSlowAIStatusAndPreviewAreScopedToCurrentOverlayLifecycle() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent("Sources/Fluid/ContentView.swift"),
+            encoding: .utf8
+        )
+        let slowStatusSection = try XCTUnwrap(
+            source.components(separatedBy: "private func makeAIProcessingFeedback(").last?
+                .components(separatedBy: "private func prepareOverlayForASRStop(").first
+        )
+
+        XCTAssertTrue(slowStatusSection.contains("self.overlayLifecycleID == lifecycleID"))
+        XCTAssertTrue(slowStatusSection.contains("self.menuBarManager.setProcessing(true)"))
+        XCTAssertTrue(slowStatusSection.contains("let streamPreview = DictationAIStreamPreviewBuffer"))
+
+        let stopSection = try XCTUnwrap(
+            source.components(separatedBy: "private func stopAndProcessTranscription(").last?
+                .components(separatedBy: "private func makeAIProcessingFeedback(").first
+        )
+        let lifecycleSnapshotIndex = try XCTUnwrap(
+            stopSection.range(of: "let expectedOverlayLifecycleID = self.overlayLifecycleID")
+        )
+        let ASRStopIndex = try XCTUnwrap(stopSection.range(of: "let transcribedText = await asr.stop"))
+        XCTAssertLessThan(lifecycleSnapshotIndex.lowerBound, ASRStopIndex.lowerBound)
+        XCTAssertEqual(
+            stopSection.components(separatedBy: "let expectedOverlayLifecycleID = self.overlayLifecycleID").count,
+            2
+        )
+    }
+
     func testDictionaryTrackingStartsAfterDeliveryCallbackReturns() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -591,7 +692,10 @@ final class DirectAudioReliabilityTests: XCTestCase {
                 timeoutNanoseconds: 10_000_000_000
             )
         }
-        await Task.yield()
+        for _ in 0..<100 where !gate.hasRegisteredWaiter(sessionID: 41, attemptID: 1) {
+            await Task.yield()
+        }
+        XCTAssertTrue(gate.hasRegisteredWaiter(sessionID: 41, attemptID: 1))
 
         gate.arm(sessionID: 41, attemptID: 2)
 

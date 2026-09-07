@@ -84,16 +84,18 @@ final nonisolated class DictationAIStreamPreviewBuffer: @unchecked Sendable {
     private let publisher: Publisher
     private var bufferedText = ""
     private var lastPublishedText = ""
-    private var lastUIUpdate = ProcessInfo.processInfo.systemUptime
+    private var nextEligibleUIUpdate: TimeInterval
     private var isUIUpdateScheduled = false
 
     init(
         minimumUpdateInterval: TimeInterval = 0.033,
+        initialUpdateDelay: TimeInterval = 0.5,
         publisher: @escaping Publisher = { text in
             NotchOverlayManager.shared.updateTranscriptionText(text)
         }
     ) {
         self.minimumUpdateInterval = minimumUpdateInterval
+        self.nextEligibleUIUpdate = ProcessInfo.processInfo.systemUptime + initialUpdateDelay
         self.publisher = publisher
     }
 
@@ -102,7 +104,7 @@ final nonisolated class DictationAIStreamPreviewBuffer: @unchecked Sendable {
         let shouldSchedule = self.lock.withLock {
             self.bufferedText += chunk
             guard !self.isUIUpdateScheduled,
-                  ProcessInfo.processInfo.systemUptime - self.lastUIUpdate >= self.minimumUpdateInterval
+                  ProcessInfo.processInfo.systemUptime >= self.nextEligibleUIUpdate
             else {
                 return false
             }
@@ -134,7 +136,7 @@ final nonisolated class DictationAIStreamPreviewBuffer: @unchecked Sendable {
                 return nil
             }
             self.isUIUpdateScheduled = false
-            self.lastUIUpdate = ProcessInfo.processInfo.systemUptime
+            self.nextEligibleUIUpdate = ProcessInfo.processInfo.systemUptime + self.minimumUpdateInterval
             guard self.bufferedText != self.lastPublishedText else { return nil }
             self.lastPublishedText = self.bufferedText
             return self.bufferedText
@@ -229,6 +231,8 @@ enum ShortcutRecordingTarget: Hashable {
 
 // swiftlint:disable type_body_length file_length
 struct ContentView: View {
+    private static let aiProcessingStatusDelayNanoseconds: UInt64 = 500_000_000
+
     private enum ActiveRecordingMode: String {
         case none
         case dictate
@@ -2520,6 +2524,7 @@ struct ContentView: View {
     private func stopAndProcessTranscription(route: DictationOutputRoute = .normal) async {
         let pipelineStartedAt = ProcessInfo.processInfo.systemUptime
         let pipelineID = UUID().uuidString
+        let expectedOverlayLifecycleID = self.overlayLifecycleID
         self.appBench("pipeline_begin id=\(pipelineID) route=\(route.rawValue)")
         defer {
             self.appBench("pipeline_handler_return id=\(pipelineID) elapsedMs=\((ProcessInfo.processInfo.systemUptime - pipelineStartedAt) * 1000) deliveryMayBePending=true")
@@ -2550,9 +2555,9 @@ struct ContentView: View {
         )
 
         self.clearActiveRecordingMode()
-        let stopOverlay = self.prepareOverlayForASRStop(
-            shouldHideOverlayOnStop: shouldHideOverlayOnStop
-        )
+        let stopOverlay = self.prepareOverlayForASRStop(shouldHideOverlayOnStop: shouldHideOverlayOnStop)
+        let stopUIInvalidationHold = self.holdStopUIInvalidation(whileProcessing: !stopOverlay.didRequestHide)
+        defer { self.releaseStopUIInvalidation(stopUIInvalidationHold) }
 
         // Stop the ASR service and wait for transcription to complete
         // The processing indicator will stay visible during this phase
@@ -2715,13 +2720,11 @@ struct ContentView: View {
             postProcessingModel = postProcessingModelInfo.model
             let postProcessingInputChars = normalizedTranscribedText.count
             let postProcessingStart = ProcessInfo.processInfo.systemUptime
+            let processingFeedback = self.makeAIProcessingFeedback(lifecycleID: expectedOverlayLifecycleID)
+            let refiningStatusTask = processingFeedback.statusTask
+            defer { refiningStatusTask.cancel() }
 
-            // Update overlay text to show we're now refining (processing already true)
-            self.appBench("processing_ui_request status=Refining")
-            NotchOverlayManager.shared.updateTranscriptionText("Refining")
-            self.appBench("processing_ui_requested status=Refining")
-
-            let streamPreview = DictationAIStreamPreviewBuffer()
+            let streamPreview = processingFeedback.streamPreview
             let streamHandler: PrivateAIStreamHandler = { chunk in
                 streamPreview.append(chunk)
             }
@@ -2735,12 +2738,14 @@ struct ContentView: View {
                     streamHandler: streamHandler,
                     benchmarkID: pipelineID
                 )
+                refiningStatusTask.cancel()
                 finalText = result.text
                 self.appBench("ai_process_return id=\(pipelineID)")
                 aiTokensPerSecond = result.tokensPerSecond
                 streamPreview.flush()
                 self.appBench("ai_preview_flushed id=\(pipelineID)")
             } catch {
+                refiningStatusTask.cancel()
                 // Fall back to the raw transcription so the user still gets
                 // their words typed instead of an error string.
                 DebugLogger.shared.error(
@@ -2909,7 +2914,6 @@ struct ContentView: View {
                 )
                 didTypeExternally = deliveryOutcome.didInsert
             } else {
-                let expectedOverlayLifecycleID = self.overlayLifecycleID
                 let shouldHideOverlayAfterDelivery = !shouldShowAIProcessingFailure
                     && !stopOverlay.didRequestHide
                 self.asr.typeOutputPlanToActiveField(
@@ -2969,6 +2973,31 @@ struct ContentView: View {
         }
     }
 
+    private func makeAIProcessingFeedback(
+        lifecycleID: UInt64
+    ) -> (statusTask: Task<Void, Never>, streamPreview: DictationAIStreamPreviewBuffer) {
+        // Fast local cleanup should finish before transient SwiftUI work can queue
+        // ahead of its result. Slow providers still receive visible status feedback.
+        let statusTask = scheduleDeferredMainActorOperation(
+            afterNanoseconds: Self.aiProcessingStatusDelayNanoseconds
+        ) {
+            guard self.overlayLifecycleID == lifecycleID else {
+                self.appBench("processing_ui_skipped status=Refining reason=stale_lifecycle")
+                return
+            }
+            self.menuBarManager.flushDeferredStoppedRecordingState()
+            self.menuBarManager.setProcessing(true)
+            self.appBench("processing_ui_request status=Refining trigger=delayed_status")
+            NotchOverlayManager.shared.updateTranscriptionText("Refining")
+            self.appBench("processing_ui_requested status=Refining trigger=delayed_status")
+        }
+        let streamPreview = DictationAIStreamPreviewBuffer { text in
+            guard self.overlayLifecycleID == lifecycleID else { return }
+            NotchOverlayManager.shared.updateTranscriptionText(text)
+        }
+        return (statusTask, streamPreview)
+    }
+
     private func prepareOverlayForASRStop(
         shouldHideOverlayOnStop: Bool
     ) -> (didRequestHide: Bool, onFinalTranscriptionStarted: (@MainActor () -> Void)?) {
@@ -2992,12 +3021,22 @@ struct ContentView: View {
         self.menuBarManager.reserveProcessingOverlay()
         self.appBench("processing_ui_reserved trigger=warm_final_asr")
         let onFinalTranscriptionStarted: @MainActor () -> Void = {
+            self.menuBarManager.flushDeferredStoppedRecordingState()
             self.appBench("processing_ui_request status=Transcribing trigger=final_executor")
             self.menuBarManager.setProcessing(true)
             NotchOverlayManager.shared.updateTranscriptionText("Transcribing")
             self.appBench("processing_ui_requested status=Transcribing trigger=final_executor")
         }
         return (false, onFinalTranscriptionStarted)
+    }
+
+    private func holdStopUIInvalidation(whileProcessing: Bool) -> UInt64? {
+        whileProcessing ? self.asr.holdStopUIInvalidationForOutputPipeline() : nil
+    }
+
+    private func releaseStopUIInvalidation(_ generation: UInt64?) {
+        guard let generation else { return }
+        self.asr.releaseStopUIInvalidationForOutputPipeline(generation)
     }
 
     private func hideOverlayForDispatchedPaste(shouldHide: Bool, lifecycleID: UInt64) {

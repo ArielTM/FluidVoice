@@ -27,6 +27,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     private weak var asrService: ASRService?
     private var cancellables = Set<AnyCancellable>()
     private var hasDeferredStopMenuRefresh = false
+    private var hasDeferredStoppedRecordingState = false
     private var configuredASRIdentifier: ObjectIdentifier?
 
     /// Overlay management (persistent, independent of window lifecycle)
@@ -106,23 +107,36 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         asrService.$isRunning
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRunning in
-                self?.isRecording = isRunning
-                self?.updateMenuBarIcon()
+                guard let self else { return }
+                if isRunning == false, self.isProcessingActive {
+                    self.hasDeferredStoppedRecordingState = true
+                    self.overlayBench("recording_state_deferred reason=processing_active")
+                    self.handleOverlayState(isRunning: false, asrService: asrService)
+                    return
+                }
+                if isRunning {
+                    self.hasDeferredStoppedRecordingState = false
+                }
+                self.isRecording = isRunning
+                self.updateMenuBarIcon()
                 if asrService.defersStopUIInvalidation {
-                    self?.hasDeferredStopMenuRefresh = true
+                    self.hasDeferredStopMenuRefresh = true
                 } else {
-                    self?.updateMenu()
+                    self.updateMenu()
                 }
 
                 // Handle overlay lifecycle (independent of window state)
-                self?.handleOverlayState(isRunning: isRunning, asrService: asrService)
+                self.handleOverlayState(isRunning: isRunning, asrService: asrService)
             }
             .store(in: &self.cancellables)
 
         asrService.deferredStopUIInvalidationDidFlush
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
-                guard let self, self.hasDeferredStopMenuRefresh else { return }
+                guard let self,
+                      self.hasDeferredStopMenuRefresh,
+                      self.hasDeferredStoppedRecordingState == false
+                else { return }
                 self.hasDeferredStopMenuRefresh = false
                 self.updateMenu()
             }
@@ -393,6 +407,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
             self.pendingProcessingShowOperation = showItem
             DispatchQueue.main.asyncAfter(deadline: .now() + self.processingVisualDelay, execute: showItem)
         } else {
+            defer { self.flushDeferredStoppedRecordingState() }
             self.isProcessingActive = false
             self.pendingProcessingShowOperation?.cancel()
             self.pendingProcessingShowOperation = nil
@@ -436,6 +451,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         self.prepareForProcessingCompletion()
         self.overlayBench("finish_hide_request mode=immediate")
         NotchOverlayManager.shared.hideImmediately()
+        self.flushDeferredStoppedRecordingState()
         self.overlayBench(
             "finish_hide_complete mode=immediate elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
         )
@@ -450,6 +466,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         NotchOverlayManager.shared.setProcessing(false)
         self.overlayBench("finish_hide_request mode=awaited")
         let hideOutcome = await NotchOverlayManager.shared.hideAndWait()
+        self.flushDeferredStoppedRecordingState()
         self.overlayBench(
             "finish_hide_complete outcome=\(hideOutcome) elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
         )
@@ -464,7 +481,24 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         // ownership so the next recording can establish a fresh lifecycle.
         self.overlayVisible = false
         NotchOverlayManager.shared.setProcessing(false)
+        self.flushDeferredStoppedRecordingState()
         self.overlayBench("finish_keep_visible")
+    }
+
+    /// Recording-state observers rebuild AppKit/SwiftUI surfaces. Hold that work
+    /// while a fast ASR/AI result is in flight, then publish it after output.
+    /// Slow paths call this when their processing status becomes visible.
+    func flushDeferredStoppedRecordingState() {
+        guard self.hasDeferredStoppedRecordingState else { return }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        self.hasDeferredStoppedRecordingState = false
+        self.hasDeferredStopMenuRefresh = false
+        self.isRecording = false
+        self.updateMenuBarIcon()
+        self.updateMenu()
+        self.overlayBench(
+            "recording_state_flushed elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
+        )
     }
 
     private func cancelPendingProcessingCompletionOperations() {

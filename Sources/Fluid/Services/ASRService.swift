@@ -69,6 +69,13 @@ private nonisolated func logStreamingProviderOperationReturn(
 /// are harmless so early-return paths can share one cleanup.
 struct ASRStopUIInvalidationGate {
     private(set) var isDeferring = false
+    private var hasOutputPipelineHold = false
+    private var stopDidFinish = false
+
+    mutating func holdForOutputPipeline() {
+        self.isDeferring = true
+        self.hasOutputPipelineHold = true
+    }
 
     mutating func begin() {
         self.isDeferring = true
@@ -76,8 +83,47 @@ struct ASRStopUIInvalidationGate {
 
     mutating func finish() -> Bool {
         guard self.isDeferring else { return false }
+        self.stopDidFinish = true
+        return self.completeIfReady()
+    }
+
+    mutating func releaseOutputPipelineHold() -> Bool {
+        self.hasOutputPipelineHold = false
+        guard self.stopDidFinish else {
+            let wasDeferring = self.isDeferring
+            self.isDeferring = false
+            return wasDeferring
+        }
+        return self.completeIfReady()
+    }
+
+    mutating func forceFinish() -> Bool {
+        self.hasOutputPipelineHold = false
+        self.stopDidFinish = true
+        return self.completeIfReady()
+    }
+
+    private mutating func completeIfReady() -> Bool {
+        guard self.isDeferring, self.stopDidFinish, self.hasOutputPipelineHold == false else { return false }
         self.isDeferring = false
+        self.stopDidFinish = false
         return true
+    }
+}
+
+@MainActor
+func scheduleDeferredMainActorOperation(
+    afterNanoseconds delayNanoseconds: UInt64,
+    operation: @escaping @MainActor () -> Void
+) -> Task<Void, Never> {
+    Task { @MainActor in
+        do {
+            try await Task.sleep(nanoseconds: delayNanoseconds)
+        } catch {
+            return
+        }
+        guard Task.isCancelled == false else { return }
+        operation()
     }
 }
 
@@ -306,6 +352,8 @@ enum ASRStopOutcome: Equatable {
 /// Models are cached locally to avoid repeated downloads.
 @MainActor
 final class ASRService: ObservableObject {
+    private static let finalTranscriptionStatusDelayNanoseconds: UInt64 = 100_000_000
+
     nonisolated static func shouldAssessShortAudioSilence(
         isEnabled: Bool,
         useDictionaryTrainingPath: Bool,
@@ -413,6 +461,8 @@ final class ASRService: ObservableObject {
     let deferredStopUIInvalidationDidFlush = PassthroughSubject<Void, Never>()
     private var stopUIInvalidationGate = ASRStopUIInvalidationGate()
     private var stopUIInvalidationTimeoutTask: Task<Void, Never>?
+    private var stopUIInvalidationHoldGeneration: UInt64 = 0
+    private var activeStopUIInvalidationHold: UInt64?
     private var isStoppingFinalTranscription = false
     var defersStopUIInvalidation: Bool {
         self.stopUIInvalidationGate.isDeferring
@@ -2590,8 +2640,8 @@ final class ASRService: ObservableObject {
     ///   shouldn't wait on finalization. Only invoked when capture was actually
     ///   running (i.e. not when `stop()` early-returns because `isRunning` is false).
     /// - Parameter onFinalTranscriptionStarted: Optional main-actor callback
-    ///   scheduled only after the final transcription executor starts. It is
-    ///   not awaited, so UI work cannot delay the provider call.
+    ///   shown only when final transcription outlives the short status delay.
+    ///   Fast finalization proceeds without queuing transient UI work ahead of its result.
     func stop(
         onCaptureStopped: (@MainActor () -> Void)? = nil,
         onFinalTranscriptionStarted: (@MainActor () -> Void)? = nil,
@@ -2840,23 +2890,28 @@ final class ASRService: ObservableObject {
                         "samples=\(pcm.count) vocabEnabled=\(vocabularyProvider?.isWordBoostingActive == true) " +
                         "vocabTerms=\(vocabularyProvider?.boostedVocabularyTermsCount ?? 0)"
                 )
+                let delayedFinalStatusTask = scheduleDeferredMainActorOperation(
+                    afterNanoseconds: Self.finalTranscriptionStatusDelayNanoseconds
+                ) { [weak self] in
+                    guard let self else { return }
+                    self.publishStoppedState(for: stoppingSessionID)
+                    if let onFinalTranscriptionStarted {
+                        self.benchmarkLog("final_started_callback_begin trigger=delayed_status")
+                        onFinalTranscriptionStarted()
+                        self.benchmarkLog("final_started_callback_end trigger=delayed_status")
+                    }
+                }
+                defer { delayedFinalStatusTask.cancel() }
                 result = try await self.transcriptionExecutor.run(benchmarkSessionID: self.benchmarkSessionID) { [provider] in
                     let executionStartedAt = ProcessInfo.processInfo.systemUptime
                     DebugLogger.shared.info("ASR_BENCH t=\(executionStartedAt) final_executor_begin mainThread=\(Thread.isMainThread)", source: "ASRBenchmark")
-                    self.publishStoppedState(for: stoppingSessionID)
-                    if let onFinalTranscriptionStarted {
-                        self.benchmarkLog("final_started_callback_scheduled")
-                        Task { @MainActor in
-                            self.benchmarkLog("final_started_callback_begin")
-                            onFinalTranscriptionStarted()
-                            self.benchmarkLog("final_started_callback_end")
-                        }
-                    }
                     defer {
                         DebugLogger.shared.info("ASR_BENCH t=\(ProcessInfo.processInfo.systemUptime) final_executor_end", source: "ASRBenchmark")
                     }
                     return try await provider.transcribeFinal(pcm)
                 }
+                delayedFinalStatusTask.cancel()
+                self.publishStoppedState(for: stoppingSessionID)
                 self.benchmarkLog("final_executor_return")
                 finalSource = "full"
             }
@@ -2964,10 +3019,28 @@ final class ASRService: ObservableObject {
         self.stopUIInvalidationGate.begin()
         self.stopUIInvalidationTimeoutTask?.cancel()
         self.stopUIInvalidationTimeoutTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
             guard Task.isCancelled == false else { return }
-            self?.finishDeferredStopUIInvalidation()
+            self?.forceFinishDeferredStopUIInvalidation()
         }
+    }
+
+    /// Keeps whole-view invalidation from rebuilding SwiftUI between final ASR
+    /// and output dispatch. The generation makes stale pipeline cleanup harmless.
+    func holdStopUIInvalidationForOutputPipeline() -> UInt64 {
+        self.stopUIInvalidationHoldGeneration &+= 1
+        let generation = self.stopUIInvalidationHoldGeneration
+        self.activeStopUIInvalidationHold = generation
+        self.stopUIInvalidationGate.holdForOutputPipeline()
+        return generation
+    }
+
+    func releaseStopUIInvalidationForOutputPipeline(_ generation: UInt64) {
+        guard self.activeStopUIInvalidationHold == generation else { return }
+        self.activeStopUIInvalidationHold = nil
+        self.flushDeferredStopUIInvalidation(
+            shouldFlush: self.stopUIInvalidationGate.releaseOutputPipelineHold()
+        )
     }
 
     /// Publishes the stopped state only after final ASR has entered its
@@ -2991,7 +3064,16 @@ final class ASRService: ObservableObject {
     }
 
     private func finishDeferredStopUIInvalidation() {
-        guard self.stopUIInvalidationGate.finish() else { return }
+        self.flushDeferredStopUIInvalidation(shouldFlush: self.stopUIInvalidationGate.finish())
+    }
+
+    private func forceFinishDeferredStopUIInvalidation() {
+        self.activeStopUIInvalidationHold = nil
+        self.flushDeferredStopUIInvalidation(shouldFlush: self.stopUIInvalidationGate.forceFinish())
+    }
+
+    private func flushDeferredStopUIInvalidation(shouldFlush: Bool) {
+        guard shouldFlush else { return }
         self.stopUIInvalidationTimeoutTask?.cancel()
         self.stopUIInvalidationTimeoutTask = nil
         self.objectWillChange.send()

@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 MARKER = re.compile(
-    r"\b(APP_BENCH|ASR_BENCH|FI_BRIDGE_BENCH|LLM_BENCH|OVERLAY_BENCH|TYPING_BENCH|HISTORY_BENCH|PIPELINE_SUMMARY)\b(.*)"
+    r"\b(APP_BENCH|ASR_BENCH|FI_SERVICE_BENCH|FI_BRIDGE_BENCH|LLM_BENCH|OVERLAY_BENCH|TYPING_BENCH|HISTORY_BENCH|PIPELINE_SUMMARY)\b(.*)"
 )
 FIELD = re.compile(r"(?:^|\s)(\w+)=([^\s]+)")
 WALL = re.compile(r"^\[([\d:.]+)\]")
@@ -37,14 +37,20 @@ def parse_logs(lines):
             current, by_id = None, {}
             continue
         match = MARKER.search(line)
-        if not match:
+        private_result = "Private provider post-processing complete" in line
+        if not match and not private_result:
             if current and ("Cancel shortcut pressed" in line or "stopWithoutTranscription" in line):
                 current["cancelled"] = True
             continue
-        family, body = match.groups()
+        if private_result:
+            family, body = "FI_RESULT", line.split("Private provider post-processing complete", 1)[1]
+        else:
+            family, body = match.groups()
         fields = dict(FIELD.findall(body))
         words = [part for part in body.split() if "=" not in part]
-        name = " ".join(words) if family != "PIPELINE_SUMMARY" else "summary"
+        name = "complete" if family == "FI_RESULT" else (
+            " ".join(words) if family != "PIPELINE_SUMMARY" else "summary"
+        )
         try:
             timestamp = float(fields["t"])
         except (KeyError, ValueError):
@@ -65,6 +71,15 @@ def parse_logs(lines):
             if current["id"]:
                 by_id[current["id"]] = current
         target = by_id.get(fields.get("id"), current)
+        if family == "FI_RESULT":
+            # This provider log has no pipeline ID. Attach it only while the
+            # current recording has an AI call that has not returned, so an
+            # unrelated Local API request cannot contaminate a dictation.
+            ai_names = [event["name"] for event in target["events"]] if target else []
+            last_call = max((index for index, name in enumerate(ai_names) if name == "ai_process_call"), default=-1)
+            last_return = max((index for index, name in enumerate(ai_names) if name == "ai_process_return"), default=-1)
+            if last_call <= last_return:
+                continue
         # An unknown callback ID must not contaminate a newer recording.
         if fields.get("id") and family in ("APP_BENCH", "PIPELINE_SUMMARY") and name != "pipeline_begin":
             target = by_id.get(fields["id"])
@@ -95,6 +110,12 @@ def summarize(run):
     def time(event):
         return event["t"] if event else None
 
+    def numeric_field(event, key):
+        try:
+            return float(event["fields"][key]) if event else None
+        except (KeyError, ValueError):
+            return None
+
     def delta(end, start):
         return round((end - start) * 1000, 1) if end is not None and start is not None else None
 
@@ -119,10 +140,17 @@ def summarize(run):
         "ai_call": time(find("APP_BENCH", {"ai_process_call"}, after)),
         "ai_route_resolved": time(find("APP_BENCH", {"ai_route_resolved"}, after)),
         "ai_private_call": time(find("APP_BENCH", {"ai_private_call"}, after)),
+        "ai_service_enter": time(find("FI_SERVICE_BENCH", {"enhance_enter"}, after)),
+        "ai_service_call": time(find("FI_SERVICE_BENCH", {"provider_call"}, after)),
+        "ai_adapter_call": time(find("FI_BRIDGE_BENCH", {"adapter_call"}, after)),
         "ai_bridge_enter": time(find("FI_BRIDGE_BENCH", {"enhance_enter"}, after)),
+        "ai_bridge_validated": time(find("FI_BRIDGE_BENCH", {"validated"}, after)),
+        "ai_bridge_client_ready": time(find("FI_BRIDGE_BENCH", {"client_ready"}, after)),
         "ai_model_call": time(find("FI_BRIDGE_BENCH", {"run_call"}, after)),
         "ai_model_return": time(find("FI_BRIDGE_BENCH", {"run_return"}, after)),
         "ai_bridge_return": time(find("FI_BRIDGE_BENCH", {"enhance_return"}, after)),
+        "ai_adapter_return": time(find("FI_BRIDGE_BENCH", {"adapter_return"}, after)),
+        "ai_service_return": time(find("FI_SERVICE_BENCH", {"provider_return"}, after)),
         "ai_private_return": time(find("APP_BENCH", {"ai_private_return"}, after)),
         "llm_call_enter": time(find("LLM_BENCH", {"call_enter"}, after)),
         "llm_request_built": time(find("LLM_BENCH", {"request_built"}, after)),
@@ -148,6 +176,14 @@ def summarize(run):
     stop_event_index = next((index for index, event in enumerate(events)
                              if event["t"] == stop and event["family"] == "APP_BENCH"), 0)
     provider_final = find_untimed("ASR_BENCH", {"provider_final_done"}, stop_event_index)
+    private_results = [
+        event for event in events[stop_event_index:]
+        if event["family"] == "FI_RESULT" and event["name"] == "complete"
+    ]
+    # FI completion logs do not carry a pipeline ID. If another local request
+    # finishes during this dictation, suppress the breakdown instead of
+    # guessing which result belongs to the hotkey pipeline.
+    private_result = private_results[0] if len(private_results) == 1 else None
     final_request = find("ASR_BENCH", {"final_executor_request"}, after)
     ai_call = find("APP_BENCH", {"ai_process_call"}, after)
     summary = find("PIPELINE_SUMMARY", {"summary"}, after)
@@ -166,6 +202,21 @@ def summarize(run):
         provider_final_ms = float(provider_final["fields"]["elapsedMs"]) if provider_final else None
     except (KeyError, ValueError):
         provider_final_ms = None
+    fi_setup_ms = numeric_field(private_result, "setupMs")
+    fi_request_ms = numeric_field(private_result, "requestMs")
+    fi_model_ms = numeric_field(private_result, "totalMs")
+    fi_prefill_ms = numeric_field(private_result, "prefillMs")
+    fi_ttft_ms = numeric_field(private_result, "ttftMs")
+    fi_decode_ms = numeric_field(private_result, "decodeMs")
+    fi_return_ms = numeric_field(private_result, "returnMs")
+    ai_processing_ms = delta(phases["ai_return"], phases["ai_call"])
+    ai_route_ms = delta(phases["ai_route_resolved"], phases["ai_call"])
+    fi_known_ms = [value for value in (fi_setup_ms, fi_request_ms, fi_return_ms) if value is not None]
+    fi_remaining_handoff_ms = (
+        round(ai_processing_ms - (ai_route_ms or 0) - sum(fi_known_ms), 1)
+        if ai_processing_ms is not None and len(fi_known_ms) == 3
+        else None
+    )
     metrics = {
         "start_to_pcm_ms": delta(time(find("ASR_BENCH", {"first_audio"})), start),
         "start_to_overlay_ms": delta(time(find("OVERLAY_BENCH", {"bottom_visible", "bottom_order_front"})), start),
@@ -179,12 +230,30 @@ def summarize(run):
         "asr_provider_ms": provider_final_ms,
         "asr_to_ai_call_ms": delta(phases["ai_call"], phases["asr_return"]),
         "refining_to_ai_call_ms": delta(phases["ai_call"], phases["refining_requested"]),
-        "ai_route_ms": delta(phases["ai_route_resolved"], phases["ai_call"]),
+        "ai_route_ms": ai_route_ms,
+        "ai_app_to_service_ms": delta(phases["ai_service_enter"], phases["ai_private_call"]),
+        "ai_service_setup_ms": delta(phases["ai_service_call"], phases["ai_service_enter"]),
+        "ai_service_to_adapter_ms": delta(phases["ai_adapter_call"], phases["ai_service_call"]),
+        "ai_adapter_to_runtime_ms": delta(phases["ai_bridge_enter"], phases["ai_adapter_call"]),
         "ai_call_to_bridge_ms": delta(phases["ai_bridge_enter"], phases["ai_private_call"]),
+        "ai_bridge_validate_ms": delta(phases["ai_bridge_validated"], phases["ai_bridge_enter"]),
+        "ai_bridge_client_ms": delta(phases["ai_bridge_client_ready"], phases["ai_bridge_validated"]),
+        "ai_bridge_request_ms": delta(phases["ai_model_call"], phases["ai_bridge_client_ready"]),
         "ai_bridge_setup_ms": delta(phases["ai_model_call"], phases["ai_bridge_enter"]),
         "ai_model_envelope_ms": delta(phases["ai_model_return"], phases["ai_model_call"]),
         "ai_bridge_tail_ms": delta(phases["ai_bridge_return"], phases["ai_model_return"]),
+        "ai_runtime_to_adapter_ms": delta(phases["ai_adapter_return"], phases["ai_bridge_return"]),
+        "ai_adapter_to_service_ms": delta(phases["ai_service_return"], phases["ai_adapter_return"]),
+        "ai_service_to_app_ms": delta(phases["ai_private_return"], phases["ai_service_return"]),
         "ai_return_hop_ms": delta(phases["ai_private_return"], phases["ai_bridge_return"]),
+        "fi_setup_ms": fi_setup_ms,
+        "fi_request_ms": fi_request_ms,
+        "fi_model_ms": fi_model_ms,
+        "fi_prefill_ms": fi_prefill_ms,
+        "fi_ttft_ms": fi_ttft_ms,
+        "fi_decode_ms": fi_decode_ms,
+        "fi_return_ms": fi_return_ms,
+        "fi_remaining_handoff_ms": fi_remaining_handoff_ms,
         "llm_setup_ms": delta(phases["llm_call_enter"], phases["ai_route_resolved"]),
         "llm_request_build_ms": delta(phases["llm_request_built"], phases["llm_call_enter"]),
         "llm_transport_to_response_ms": delta(phases["llm_response"], phases["llm_attempt_start"]),
@@ -201,7 +270,7 @@ def summarize(run):
             else phases["llm_response"],
         ),
         "llm_return_hop_ms": delta(phases["ai_return"], phases["llm_call_return"]),
-        "ai_processing_ms": delta(phases["ai_return"], phases["ai_call"]),
+        "ai_processing_ms": ai_processing_ms,
         "ai_to_ready_ms": delta(phases["text_ready"], phases["ai_return"]),
         "internal_stop_to_ready_ms": delta(phases["text_ready"], stop),
     }
@@ -263,6 +332,28 @@ def render(rows, details=False):
             values = [m["ai_route_ms"], m["ai_call_to_bridge_ms"], m["ai_bridge_setup_ms"],
                       m["ai_model_envelope_ms"], m["ai_bridge_tail_ms"], m["ai_return_hop_ms"],
                       m["ai_processing_ms"]]
+            lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | " + " | ".join(map(fmt, values)) + " |")
+    if any(row["metrics"]["ai_app_to_service_ms"] is not None for row in rows):
+        lines += ["", "## FI actor and setup detail", "",
+                  "| Time / ID | App→service | Service setup | Service→adapter | Adapter→runtime | Validate | Cached client | Request | Runtime→adapter | Adapter→service | Service→app |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for row in rows:
+            m = row["metrics"]
+            values = [m["ai_app_to_service_ms"], m["ai_service_setup_ms"],
+                      m["ai_service_to_adapter_ms"], m["ai_adapter_to_runtime_ms"],
+                      m["ai_bridge_validate_ms"], m["ai_bridge_client_ms"],
+                      m["ai_bridge_request_ms"], m["ai_runtime_to_adapter_ms"],
+                      m["ai_adapter_to_service_ms"], m["ai_service_to_app_ms"]]
+            lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | " + " | ".join(map(fmt, values)) + " |")
+    if any(row["metrics"]["fi_request_ms"] is not None for row in rows):
+        lines += ["", "## Private FI handoff", "",
+                  "| Time / ID | Setup | Request | Model | Prefill | TTFT | Decode | Inside return | Remaining handoff | AI total |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for row in rows:
+            m = row["metrics"]
+            values = [m["fi_setup_ms"], m["fi_request_ms"], m["fi_model_ms"],
+                      m["fi_prefill_ms"], m["fi_ttft_ms"], m["fi_decode_ms"],
+                      m["fi_return_ms"], m["fi_remaining_handoff_ms"], m["ai_processing_ms"]]
             lines.append(f"| {row['time']} / {(row['id'] or '?')[:8]} | " + " | ".join(map(fmt, values)) + " |")
     if any(row["metrics"]["llm_request_build_ms"] is not None for row in rows):
         lines += ["", "## External AI handoff detail", "",

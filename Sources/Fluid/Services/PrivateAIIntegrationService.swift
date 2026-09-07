@@ -2,6 +2,7 @@ import Foundation
 
 actor PrivateAIIntegrationService {
     static let shared = PrivateAIIntegrationService()
+    private nonisolated let dictationProviderOverride: (any PrivateAIIntegrationProviding)?
 
     static var selectedModelDefaultsKey: String {
         PrivateAIProviderFeature.shared.selectedModelDefaultsKey
@@ -55,12 +56,24 @@ actor PrivateAIIntegrationService {
         let message: String?
     }
 
-    private init() {}
+    private init() {
+        self.dictationProviderOverride = nil
+    }
+
+    #if DEBUG
+    init(testingProvider: any PrivateAIIntegrationProviding) {
+        self.dictationProviderOverride = testingProvider
+    }
+    #endif
 
     private nonisolated static var provider: any PrivateAIIntegrationProviding {
         PrivateAIProviderFeature.shared.isAvailable
             ? PrivateAIProviderRegistry.integration
             : UnavailableAIIntegrationShim.shared
+    }
+
+    private nonisolated var dictationProvider: any PrivateAIIntegrationProviding {
+        self.dictationProviderOverride ?? Self.provider
     }
 
     nonisolated static var configuredModelID: String {
@@ -240,31 +253,40 @@ actor PrivateAIIntegrationService {
         await Self.provider.shutdownForTermination()
     }
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: RuntimeConfiguration,
         context: AppContext
     ) async throws -> EnhancementResult {
-        try Self.validateDictationHeadroom(inputText, contextTokenLimit: runtime.contextTokenLimit)
-        return try await Self.provider.enhanceDictation(inputText, runtime: runtime, context: context)
+        let budget = try Self.validatedDictationBudget(inputText, contextTokenLimit: runtime.contextTokenLimit)
+        return try await self.dictationProvider.enhanceDictation(
+            inputText,
+            runtime: runtime,
+            context: context,
+            maxOutputTokens: budget.maxOutputTokens
+        )
     }
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: RuntimeConfiguration,
         context: AppContext,
         streamHandler: PrivateAIStreamHandler?
     ) async throws -> EnhancementResult {
-        try Self.validateDictationHeadroom(inputText, contextTokenLimit: runtime.contextTokenLimit)
-        return try await Self.provider.enhanceDictation(
+        let budget = try Self.validatedDictationBudget(inputText, contextTokenLimit: runtime.contextTokenLimit)
+        return try await self.dictationProvider.enhanceDictation(
             inputText,
             runtime: runtime,
             context: context,
+            maxOutputTokens: budget.maxOutputTokens,
             streamHandler: streamHandler
         )
     }
 
-    private nonisolated static func validateDictationHeadroom(_ inputText: String, contextTokenLimit: Int) throws {
+    private nonisolated static func validatedDictationBudget(
+        _ inputText: String,
+        contextTokenLimit: Int
+    ) throws -> SettingsStore.PrivateAIDictationTokenBudget {
         let budget = SettingsStore.privateAIDictationTokenBudget(
             forInputText: inputText,
             contextTokenLimit: contextTokenLimit
@@ -272,6 +294,7 @@ actor PrivateAIIntegrationService {
         guard budget.hasSufficientHeadroom else {
             throw AIProcessingError.dictationExceedsAIContextWindow
         }
+        return budget
     }
 
     func rewrite(
@@ -348,10 +371,11 @@ private struct UnavailableAIIntegrationShim: PrivateAIIntegrationProviding {
 
     func unloadCachedRuntime(reason _: String) async {}
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime _: PrivateAIIntegrationService.RuntimeConfiguration,
-        context _: PrivateAIIntegrationService.AppContext
+        context _: PrivateAIIntegrationService.AppContext,
+        maxOutputTokens _: Int
     ) async throws -> PrivateAIIntegrationService.EnhancementResult {
         PrivateAIIntegrationService.EnhancementResult(
             outputText: inputText,
