@@ -179,6 +179,33 @@ final class RemoteDesktopTypingTests: XCTestCase {
         XCTAssertEqual(map[" "]?.needsShift, false)
     }
 
+    // MARK: - Layout agreement
+
+    func testLayoutSafeMapKeepsOnlyPositionsBothReadingsAgreeOn() {
+        // A guest may mirror the local layout (RDP's default) or be plain ANSI. Only characters
+        // whose position is identical under both are safe; the rest must take the lossless path.
+        let ansi = RemoteDesktopKeyMapResolver.ansiKeyMap
+        let safe = RemoteDesktopKeyMapResolver.layoutSafeMap()
+
+        XCTAssertFalse(safe.isEmpty, "a Latin layout must retain a usable set")
+        for (character, stroke) in safe {
+            XCTAssertEqual(stroke, ansi[character], "a safe stroke must match the ANSI position")
+        }
+        XCTAssertLessThanOrEqual(safe.count, ansi.count, "agreement can only narrow the set")
+
+        let local = RemoteDesktopKeyMapResolver.localLayoutMap()
+        if local.isEmpty == false {
+            for (character, stroke) in safe {
+                XCTAssertEqual(stroke, local[character], "a safe stroke must match the local position too")
+            }
+        }
+    }
+
+    func testLocalLayoutMapIsEmptyForMissingData() {
+        XCTAssertTrue(RemoteDesktopKeyMapResolver.localLayoutMap(layoutData: nil, keyboardType: 0).isEmpty)
+        XCTAssertTrue(RemoteDesktopKeyMapResolver.localLayoutMap(layoutData: Data(), keyboardType: 0).isEmpty)
+    }
+
     // MARK: - Paste chord position
 
     func testPasteChordUsesTheGuestPositionForV() {

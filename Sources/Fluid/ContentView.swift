@@ -3454,6 +3454,10 @@ struct ContentView: View {
     /// system clipboard, and unlike reprocess, it pastes the existing text verbatim (no new
     /// history entry, no reformatting). Useful when the original auto-insert dropped the tail.
     private func pasteLastDictationFromHistory() {
+        // Records this shortcut's own modifiers. Without it the insertion would decide the
+        // guest's menu state from whatever the previous dictation recorded.
+        TypingService.noteDictationHotkeyModifiers()
+
         guard let last = TranscriptionHistoryStore.shared.entries.first else {
             DebugLogger.shared.info("Actions: Paste requested but history is empty", source: "ContentView")
             return
@@ -4196,8 +4200,6 @@ struct ContentView: View {
             },
             commandModeCallback: {
                 DebugLogger.shared.info("Command mode triggered", source: "ContentView")
-                self.captureRecordingContext()
-
                 // Set flag so stopAndProcessTranscription knows to process as command
                 self.setActiveRecordingMode(.command)
 
@@ -4205,6 +4207,11 @@ struct ContentView: View {
                 self.menuBarManager.setOverlayMode(.command)
 
                 guard !self.asr.isRunningOrStarting else { return }
+
+                // Captured only once the start is going ahead. Before this guard, a rejected
+                // start overwrote the modifier snapshot belonging to the dictation already in
+                // flight, which decides whether the remote session needs its keyboard reset.
+                self.captureRecordingContext()
 
                 self.advanceOverlayLifecycle()
 

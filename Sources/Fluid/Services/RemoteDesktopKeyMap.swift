@@ -132,6 +132,69 @@ enum RemoteDesktopKeyMapResolver {
         return map
     }()
 
+    /// Characters safe to type regardless of which layout the guest applies.
+    ///
+    /// Two plausible guest layouts have to agree. A client in Scancode mode forwards key
+    /// positions and the guest applies its own layout, and RDP normally sends the *client's*
+    /// layout to the session - so the guest is usually a mirror of the local layout, but may
+    /// equally be plain ANSI (a pre-existing session, an unrecognised layout, or one set
+    /// administratively). A fixed ANSI table alone is therefore wrong for an AZERTY or QWERTZ
+    /// guest, where the ANSI position of `a` yields `q`; a purely local table is wrong for an
+    /// ANSI guest.
+    ///
+    /// So only characters whose position is *identical* under both readings are offered. On a US
+    /// or ABC layout that is all of printable ASCII; on AZERTY the transposed keys drop out and
+    /// take the lossless fallback instead of being silently mistyped. The guest's layout cannot
+    /// be interrogated through the client, so agreement is the strongest guarantee available.
+    static func layoutSafeMap() -> [Character: RemoteDesktopKeyStroke] {
+        let local = self.localLayoutMap()
+        guard local.isEmpty == false else { return self.ansiKeyMap }
+        return self.ansiKeyMap.filter { character, ansiStroke in local[character] == ansiStroke }
+    }
+
+    /// The active layout's own character-to-position map, used only to confirm agreement with
+    /// ``ansiKeyMap``. Dead keys are excluded: they compose the following character rather than
+    /// emitting a glyph, so treating them as typeable would corrupt text.
+    static func localLayoutMap() -> [Character: RemoteDesktopKeyStroke] {
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+        else { return [:] }
+        let data = Unmanaged<CFData>.fromOpaque(pointer).takeUnretainedValue() as Data
+        return self.localLayoutMap(layoutData: data, keyboardType: UInt32(LMGetKbdType()))
+    }
+
+    static func localLayoutMap(layoutData: Data?, keyboardType: UInt32) -> [Character: RemoteDesktopKeyStroke] {
+        guard let layoutData, layoutData.isEmpty == false else { return [:] }
+        return layoutData.withUnsafeBytes { bytes -> [Character: RemoteDesktopKeyStroke] in
+            guard let layout = bytes.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else {
+                return [:]
+            }
+            var map: [Character: RemoteDesktopKeyStroke] = [:]
+            for needsShift in [false, true] {
+                let modifiers = needsShift ? UInt32(shiftKey >> 8) : 0
+                for key: UInt16 in 0..<128 {
+                    guard self.keypadKeyCodeRange.contains(key) == false, key != self.isoSectionKeyCode
+                    else { continue }
+                    var deadKeyState: UInt32 = 0
+                    var length = 0
+                    var characters = [UniChar](repeating: 0, count: 4)
+                    let status = UCKeyTranslate(
+                        layout, key, UInt16(kUCKeyActionDisplay), modifiers, keyboardType,
+                        0, &deadKeyState, characters.count, &length, &characters
+                    )
+                    guard status == noErr, deadKeyState == 0, length == 1 else { continue }
+                    let value = characters[0]
+                    guard value >= 0x20, value != 0x7f, let scalar = UnicodeScalar(value) else { continue }
+                    let character = Character(scalar)
+                    if map[character] == nil {
+                        map[character] = RemoteDesktopKeyStroke(keyCode: CGKeyCode(key), needsShift: needsShift)
+                    }
+                }
+            }
+            return map
+        }
+    }
+
     /// Spells `text` out as key presses, or reports every character that has no key on this
     /// layout.
     ///

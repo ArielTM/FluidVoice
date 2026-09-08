@@ -264,8 +264,17 @@ final class TypingService {
         self.focusSnapshotQueue.sync { self.dictationHotkeyModifiers = flags }
     }
 
-    private static func recordedDictationHotkeyModifiers() -> CGEventFlags? {
-        self.focusSnapshotQueue.sync { self.dictationHotkeyModifiers }
+    /// Reads and clears the recorded modifiers.
+    ///
+    /// One-shot on purpose. The value describes a single dictation, and insertion paths that do
+    /// not record it - Paste Last Transcription, for one - would otherwise read whatever the
+    /// previous dictation left behind and decide the guest's menu state from stale input.
+    private static func consumeDictationHotkeyModifiers() -> CGEventFlags? {
+        self.focusSnapshotQueue.sync {
+            let flags = self.dictationHotkeyModifiers
+            self.dictationHotkeyModifiers = nil
+            return flags
+        }
     }
 
     static func captureSystemFocusTarget() -> CapturedFocusTarget? {
@@ -1294,7 +1303,7 @@ final class TypingService {
         targetPID: pid_t
     ) -> RemoteDesktopTypingOutcome {
         let normalized = RemoteDesktopKeyMapResolver.transliterate(text)
-        let map = RemoteDesktopKeyMapResolver.ansiKeyMap
+        let map = RemoteDesktopKeyMapResolver.layoutSafeMap()
 
         let strokes: [RemoteDesktopKeyStroke]
         let capsLockActive = CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift)
@@ -1320,6 +1329,15 @@ final class TypingService {
             return .declined
         }
 
+
+        // The reset is itself a batch of global HID events, including possibly Escape, so the
+        // destination has to be confirmed before it is posted - otherwise a focus change between
+        // resolving the target and starting the run sends Escape to some other application and
+        // cancels whatever it had open. The per-chord checks below cover only the typing.
+        guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
+            self.log("[TypingService] ERROR: Target is not frontmost; skipping remote-desktop reset and typing")
+            return .declined
+        }
 
         // The hotkey that started this dictation is very often a modifier (the default is
         // modifier-only), and the client forwards that modifier's press and release to the guest
@@ -1412,13 +1430,13 @@ final class TypingService {
         // Prefer what was actually held when this dictation started. Asking whether *any*
         // configured shortcut uses Option or Command would send Escape for a dictation begun
         // with a mouse or a plain-key shortcut, where there is no menu to dismiss.
-        if let observed = Self.recordedDictationHotkeyModifiers() {
+        if let observed = Self.consumeDictationHotkeyModifiers() {
             return observed.contains(.maskAlternate) || observed.contains(.maskCommand)
         }
 
-        // Nothing recorded (a caller that does not go through the recording path). Fall back to
-        // the configured shortcuts, which is over-broad but keeps the first character from being
-        // eaten when a menu really was opened.
+        // Nothing recorded, or already consumed. Fall back to the configured shortcuts, which
+        // is over-broad but errs the safer way: failing to leave menu mode means the transcript
+        // navigates menus and can act on the guest, whereas an unnecessary Escape only cancels.
         let shortcuts = SettingsStore.shared.primaryDictationShortcuts
         guard shortcuts.isEmpty == false else { return true }
         return shortcuts.contains { shortcut in
