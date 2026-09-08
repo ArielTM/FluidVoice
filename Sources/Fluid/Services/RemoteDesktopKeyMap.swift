@@ -105,18 +105,37 @@ enum RemoteDesktopKeyMapResolver {
         (50, "`", "~"),
     ]
 
+    /// The ANSI position of `v`, used as the Ctrl+V position when the local layout has no `v`
+    /// of its own to compare against.
+    static let ansiPasteKeyCode: CGKeyCode = 9
+
     /// The position to press for `v` in a Ctrl+V chord forwarded to the guest, or nil when no
     /// position can be trusted.
     ///
     /// Deliberately not `PasteKeyCodeResolver`, which answers a different question: that
     /// resolves the *local* Command+V shortcut, which the client handles itself. This chord is
-    /// forwarded as a scan code and translated by the guest, so it is subject to exactly the
-    /// same ambiguity as ``layoutSafeMap`` - on a Dvorak guest the ANSI position of `v` is a
-    /// different letter, and Ctrl plus that letter may be an unrelated shortcut. So the position
-    /// has to be one both readings agree on, and when they do not, the caller declines rather
-    /// than pressing something unknown.
-    static func layoutSafePasteKeyCode(map: [Character: RemoteDesktopKeyStroke]) -> CGKeyCode? {
-        map["v"]?.keyCode
+    /// forwarded as a scan code and translated by the guest, so it is subject to the same
+    /// ambiguity as ``layoutSafeMap(local:)``.
+    ///
+    /// Three cases, and the middle one is the reason this is not just a lookup:
+    ///
+    /// - The local layout agrees with ANSI on `v`. Use that position; both readings concur.
+    /// - The local layout has no `v` **at all** - Hebrew, Russian, any non-Latin script. There
+    ///   is no rearrangement to disagree about: such a layout is a script layered onto the
+    ///   standard physical arrangement, and the guest's Latin sublayout puts `v` where ANSI
+    ///   does. Use the ANSI position. Returning nil here is what made dictation into a remote
+    ///   session insert *nothing* while Hebrew was selected, because the typing path has
+    ///   already declined by then and this is the lossless fallback.
+    /// - The local layout has a `v`, in a different place - Dvorak and friends. Now the
+    ///   disagreement is a genuine rearrangement, the ANSI position is some other letter, and
+    ///   Ctrl plus that letter may be an unrelated shortcut in the guest. Decline.
+    static func layoutSafePasteKeyCode(
+        local: [Character: RemoteDesktopKeyStroke],
+        safe: [Character: RemoteDesktopKeyStroke]
+    ) -> CGKeyCode? {
+        if let agreed = safe["v"]?.keyCode { return agreed }
+        guard local.isEmpty == false else { return nil }
+        return local["v"] == nil ? self.ansiPasteKeyCode : nil
     }
 
     /// Character to key press, built from ``ansiKeyPositions``. Unshifted wins where a
@@ -154,13 +173,26 @@ enum RemoteDesktopKeyMapResolver {
     /// nothing is offered for direct typing and the caller takes the lossless path. Returning
     /// the full ANSI map here would mean a transient input-source lookup failure silently
     /// changed correct behaviour into mistyped text on a non-ANSI setup.
-    /// Resolves the active layout and applies ``layoutSafeMap(local:)``.
+    /// Everything the remote-desktop paths need from the active layout, resolved together.
+    ///
+    /// One value rather than two lookups so the typable set and the paste position always come
+    /// from the same reading of the layout.
+    struct Snapshot: Equatable {
+        /// Characters safe to type regardless of which layout the guest applies.
+        var typable: [Character: RemoteDesktopKeyStroke] = [:]
+        /// The position to press for `v` in a forwarded Ctrl+V, or nil to decline.
+        var pasteKeyCode: CGKeyCode?
+    }
+
+    /// Resolves the active layout into a ``Snapshot``.
     ///
     /// Main thread only, because it reads the input source - see ``localLayoutMap()``. This is
     /// the resolve closure for the process-wide snapshot; the typing path reads that snapshot
     /// rather than calling this, so it never touches Carbon off the main thread.
-    static func currentLayoutSafeMap() -> [Character: RemoteDesktopKeyStroke] {
-        self.layoutSafeMap(local: self.localLayoutMap())
+    static func currentSnapshot() -> Snapshot {
+        let local = self.localLayoutMap()
+        let safe = self.layoutSafeMap(local: local)
+        return Snapshot(typable: safe, pasteKeyCode: self.layoutSafePasteKeyCode(local: local, safe: safe))
     }
 
     /// Pure form: the agreement filter, given an already-resolved local layout.

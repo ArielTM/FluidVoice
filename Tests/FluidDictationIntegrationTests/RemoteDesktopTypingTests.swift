@@ -185,7 +185,7 @@ final class RemoteDesktopTypingTests: XCTestCase {
         // A guest may mirror the local layout (RDP's default) or be plain ANSI. Only characters
         // whose position is identical under both are safe; the rest must take the lossless path.
         let ansi = RemoteDesktopKeyMapResolver.ansiKeyMap
-        let safe = RemoteDesktopKeyMapResolver.currentLayoutSafeMap()
+        let safe = RemoteDesktopKeyMapResolver.currentSnapshot().typable
 
         XCTAssertFalse(safe.isEmpty, "a Latin layout must retain a usable set")
         for (character, stroke) in safe {
@@ -211,12 +211,39 @@ final class RemoteDesktopTypingTests: XCTestCase {
     func testPasteChordKeyMustSurviveLayoutAgreement() {
         // Forwarded as a scan code and translated by the guest, so it is subject to the same
         // ambiguity as the typing map: it must be a position both readings agree on, or nil.
-        let safe = RemoteDesktopKeyMapResolver.currentLayoutSafeMap()
-        XCTAssertEqual(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(map: safe), safe["v"]?.keyCode)
+        let safe = RemoteDesktopKeyMapResolver.currentSnapshot().typable
+        let local = RemoteDesktopKeyMapResolver.localLayoutMap()
+        let resolved = RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(local: local, safe: safe)
         if safe["v"] != nil {
-            XCTAssertEqual(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(map: safe), 9,
-                           "on an agreeing Latin layout that is the ANSI position")
+            XCTAssertEqual(resolved, safe["v"]?.keyCode)
+            XCTAssertEqual(resolved, 9, "on an agreeing Latin layout that is the ANSI position")
         }
+    }
+
+    func testPasteChordFallsBackToAnsiOnlyForNonLatinLayouts() {
+        let ansiV = RemoteDesktopKeyMapResolver.ansiKeyMap["v"]!
+
+        // A non-Latin layout has no `v` to disagree about: the guest's Latin sublayout puts it
+        // where ANSI does, so the lossless paste stays available instead of inserting nothing.
+        let hebrewish: [Character: RemoteDesktopKeyStroke] = ["\u{05D5}": ansiV]
+        XCTAssertEqual(
+            RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(local: hebrewish, safe: [:]),
+            RemoteDesktopKeyMapResolver.ansiPasteKeyCode,
+            "a non-Latin layout must still be able to paste"
+        )
+
+        // A Latin rearrangement does have a `v`, somewhere else. The ANSI position is a
+        // different letter there, so Ctrl plus it could be an unrelated shortcut: decline.
+        let dvorakish: [Character: RemoteDesktopKeyStroke] = [
+            "v": RemoteDesktopKeyStroke(keyCode: 47, needsShift: false),
+        ]
+        XCTAssertNil(
+            RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(local: dvorakish, safe: [:]),
+            "a rearranged Latin layout must not press an unknown position"
+        )
+
+        // Nothing read at all establishes nothing.
+        XCTAssertNil(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(local: [:], safe: [:]))
     }
 
     func testLayoutSafeMapFailsClosedWhenTheLocalLayoutIsUnreadable() {

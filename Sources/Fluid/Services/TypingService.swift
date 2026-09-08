@@ -241,11 +241,15 @@ final class TypingService {
     /// Starts empty so that a cache which never started declines to type rather than typing from
     /// a layout it has not actually read.
     private static let remoteDesktopLayoutCache = KeyboardLayoutSnapshotCache(
-        initialValue: [Character: RemoteDesktopKeyStroke]()
+        initialValue: RemoteDesktopKeyMapResolver.Snapshot()
     ) {
-        let map = RemoteDesktopKeyMapResolver.currentLayoutSafeMap()
-        DebugLogger.shared.benchmark("TYPING_BENCH", message: "remote_layout_cache_refresh characters=\(map.count)", source: "TypingBenchmark")
-        return map
+        let snapshot = RemoteDesktopKeyMapResolver.currentSnapshot()
+        DebugLogger.shared.benchmark(
+            "TYPING_BENCH",
+            message: "remote_layout_cache_refresh characters=\(snapshot.typable.count) pasteKey=\(snapshot.pasteKeyCode.map(String.init) ?? "none")",
+            source: "TypingBenchmark"
+        )
+        return snapshot
     }
 
     /// Called during application launch, before any paste requests can arrive.
@@ -1329,9 +1333,9 @@ final class TypingService {
         let normalized = RemoteDesktopKeyMapResolver.transliterate(text)
         // Snapshot, never a live lookup: this runs on a background queue and reading the input
         // source from here can trap inside HIToolbox.
-        let map = Self.remoteDesktopLayoutCache.snapshot()
+        let map = Self.remoteDesktopLayoutCache.snapshot().typable
         if map.isEmpty {
-            self.log("[TypingService] ERROR: Layout snapshot is empty - nothing can be typed or pasted into this session. Either layout tracking never started, or the local layout shares no positions with ANSI.")
+            self.log("[TypingService] Layout offers no directly typable characters; the paste fallback will carry this transcript")
         }
 
         let strokes: [RemoteDesktopKeyStroke]
@@ -1541,6 +1545,15 @@ final class TypingService {
             return false
         }
 
+        // Resolved before anything below has an effect. This used to be checked after the
+        // pasteboard had been written and focus had been bounced away for two seconds, so a
+        // layout with no usable paste position churned the user's clipboard and stole focus
+        // and then inserted nothing at all.
+        guard let pasteKeyCode = Self.remoteDesktopLayoutCache.snapshot().pasteKeyCode else {
+            self.log("[TypingService] ERROR: No trustworthy position for the paste key on this layout; refusing to press an unknown key")
+            return false
+        }
+
         // The bounce below deliberately takes focus away for roughly two seconds. A PID alone
         // cannot tell one window or session of the same client from another, so capture the
         // focused element itself and require the *same* element afterwards.
@@ -1588,13 +1601,6 @@ final class TypingService {
 
             guard self.waitForPhysicalModifiersToRelease(timeout: 0.5) else {
                 self.log("[TypingService] ERROR: Physical modifiers held after bounce; skipping remote-desktop paste")
-                return false
-            }
-
-            guard let pasteKeyCode = RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(
-                map: Self.remoteDesktopLayoutCache.snapshot()
-            ) else {
-                self.log("[TypingService] ERROR: No agreed position for the paste key; refusing to press an unknown key")
                 return false
             }
 
