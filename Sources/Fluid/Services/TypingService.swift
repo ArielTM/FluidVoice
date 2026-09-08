@@ -152,7 +152,9 @@ final class TypingService {
     static let remoteDesktopTypeDelayDefaultMs = 16
     static let remoteDesktopTypeDelayMaximumMs = 200
     static let remoteDesktopTypeDelayOverrideKey = "RemoteDesktopTypeDelayMs"
-    static let remoteDesktopFocusRecheckInterval = 10
+    /// How often the focused *element* is re-confirmed while typing. The per-chord check
+    /// compares only the PID, which cannot tell two windows of the same client apart.
+    static let remoteDesktopElementRecheckInterval = 10
 
     static let remoteDesktopWarmupDefaultMs = 250
     static let remoteDesktopWarmupMaximumMs = 3000
@@ -219,8 +221,6 @@ final class TypingService {
 
     // MARK: - Layout-aware key code lookup
 
-    private static let remoteDesktopKeyMapCache = RemoteDesktopKeyMapCache()
-
     private static let pasteKeyCache = PasteKeyCodeCache {
         let key = PasteKeyCodeResolver.current()
         DebugLogger.shared.benchmark("TYPING_BENCH", message: "paste_key_cache_refresh keyCode=\(key)", source: "TypingBenchmark")
@@ -230,7 +230,6 @@ final class TypingService {
     /// Called during application launch, before any paste requests can arrive.
     static func startKeyboardLayoutTracking() {
         self.pasteKeyCache.start()
-        self.remoteDesktopKeyMapCache.start()
     }
 
     /// The virtual key code for "v" in the current keyboard layout (used for Cmd+V paste).
@@ -851,6 +850,10 @@ final class TypingService {
                 return false
             }
 
+            // Reached without any preceding insertion when the transcript was only the send
+            // phrase, in which case the typing path's reset never ran and the guest may still
+            // be in menu mode - where Return activates a menu item instead of submitting.
+            self.resyncRemoteDesktopKeyboardState()
             self.log("[TypingService] Spoken Send: posting \(key.displayName) chord via HID tap for remote-desktop target")
             self.postRemoteDesktopChord(chord)
             return true
@@ -1261,15 +1264,15 @@ final class TypingService {
         targetPID: pid_t
     ) -> RemoteDesktopTypingOutcome {
         let normalized = RemoteDesktopKeyMapResolver.transliterate(text)
-        let map = Self.remoteDesktopKeyMapCache.snapshot()
-
-        guard map.isEmpty == false else {
-            self.log("[TypingService] ERROR: Remote-desktop key map unavailable; cannot type")
-            return .declined
-        }
+        let map = RemoteDesktopKeyMapResolver.ansiKeyMap
 
         let strokes: [RemoteDesktopKeyStroke]
-        switch RemoteDesktopKeyMapResolver.plan(for: normalized, map: map) {
+        let capsLockActive = CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift)
+        if capsLockActive {
+            self.log("[TypingService] Caps Lock is active; inverting shift for alphabetic keys")
+        }
+
+        switch RemoteDesktopKeyMapResolver.plan(for: normalized, map: map, capsLockActive: capsLockActive) {
         case let .strokes(planned):
             strokes = planned
         case let .unmappable(characters):
@@ -1287,10 +1290,6 @@ final class TypingService {
             return .declined
         }
 
-        guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
-            self.log("[TypingService] ERROR: Target is no longer frontmost; skipping remote-desktop typing")
-            return .declined
-        }
 
         // The hotkey that started this dictation is very often a modifier (the default is
         // modifier-only), and the client forwards that modifier's press and release to the guest
@@ -1321,17 +1320,27 @@ final class TypingService {
             chords.append(chord)
         }
 
+        // A PID cannot distinguish one connection window of the same client from another, so
+        // capture the focused element too and re-confirm it periodically. The element check is
+        // an Accessibility round trip, so it runs on an interval while the cheap PID check runs
+        // before every chord.
+        let focusTarget = Self.captureSystemFocusTarget()
         let perCharacterDelay = Self.remoteDesktopTypeDelay
         self.log("[TypingService] Typing \(chords.count) character(s) via HID tap at \(perCharacterDelay / 1000)ms/char")
 
+        // Checked before *every* chord, not on an interval. These events are delivered by the
+        // window server to whatever holds key focus, so any unchecked gap is a window in which
+        // transcript characters land in another application. `frontmostApplication` is a local
+        // lookup, not an Accessibility round trip, so this is cheap enough to do per character.
         for (index, chord) in chords.enumerated() {
-            // HID events go to whatever holds key focus, and a long transcript takes seconds.
-            // Without re-checking, clicking away mid-run sprays the remainder into another app -
-            // including Return presses that would confirm whatever dialog is focused there.
-            if index > 0, index % Self.remoteDesktopFocusRecheckInterval == 0,
-               self.isRemoteDesktopTargetStillFrontmost(targetPID) == false
-            {
+            guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
                 self.log("[TypingService] ERROR: Target lost focus after \(index) character(s); stopping")
+                return .declined
+            }
+            if let focusTarget, index > 0, index % Self.remoteDesktopElementRecheckInterval == 0,
+               Self.isExactFocusTargetActive(focusTarget) == false
+            {
+                self.log("[TypingService] ERROR: Focused window changed after \(index) character(s); stopping")
                 return .declined
             }
             self.postRemoteDesktopChord(chord, keyGapMicros: 1500)
@@ -1363,6 +1372,20 @@ final class TypingService {
     ///
     /// Escape is sent here as a deliberate reset, which is separate from the rule that Return
     /// and Tab are never typed as transcript *content*.
+    /// Whether the configured dictation hotkey can leave the guest in a menu state.
+    ///
+    /// A bare Alt tap activates the menu bar and a bare Windows-key tap opens the Start menu, so
+    /// only Option- and Command-based hotkeys create something for Escape to dismiss. For any
+    /// other hotkey an unconditional Escape would be a gratuitous keypress into the guest, where
+    /// it can cancel a dialog or abandon an in-progress operation.
+    private var remoteDesktopHotkeyCanEnterMenuMode: Bool {
+        let shortcuts = SettingsStore.shared.primaryDictationShortcuts
+        guard shortcuts.isEmpty == false else { return true }
+        return shortcuts.contains { shortcut in
+            shortcut.modifierFlags.contains(.option) || shortcut.modifierFlags.contains(.command)
+        }
+    }
+
     private func resyncRemoteDesktopKeyboardState() {
         for keyCode in Self.remoteDesktopResyncModifierKeyCodes {
             guard let release = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
@@ -1372,6 +1395,11 @@ final class TypingService {
             // event tap ignores it.
             release.setIntegerValueField(.eventSourceUserData, value: Self.synthesizedEventUserData)
             release.post(tap: .cghidEventTap)
+        }
+
+        guard self.remoteDesktopHotkeyCanEnterMenuMode else {
+            self.log("[TypingService] Reset remote keyboard state (modifier releases only; hotkey cannot enter menu mode)")
+            return
         }
 
         usleep(Self.remoteDesktopEscapeGapMicros)
@@ -1426,6 +1454,11 @@ final class TypingService {
             return false
         }
 
+        // The bounce below deliberately takes focus away for roughly two seconds. A PID alone
+        // cannot tell one window or session of the same client from another, so capture the
+        // focused element itself and require the *same* element afterwards.
+        let focusTargetBeforeBounce = Self.captureSystemFocusTarget()
+
         return self.withTemporaryPasteboardString(text, restoreDelayMicros: 5_000_000) {
             usleep(Self.remoteDesktopClipboardSettleMicros)
 
@@ -1450,6 +1483,19 @@ final class TypingService {
 
             guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
                 self.log("[TypingService] ERROR: Target not frontmost after focus bounce; skipping paste")
+                return false
+            }
+
+            // Same application is not enough: the paste is a single global chord carrying the
+            // whole transcript, so require the identical focused element we captured. If it
+            // cannot be confirmed, abort - `withTemporaryPasteboardString` restores the
+            // clipboard, and the transcript is still in History.
+            guard let focusTargetBeforeBounce else {
+                self.log("[TypingService] ERROR: No focus target was captured; refusing to paste blind")
+                return false
+            }
+            guard Self.isExactFocusTargetActive(focusTargetBeforeBounce) else {
+                self.log("[TypingService] ERROR: Focused element changed across the bounce; skipping paste")
                 return false
             }
 

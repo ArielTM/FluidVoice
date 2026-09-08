@@ -78,63 +78,49 @@ enum RemoteDesktopKeyMapResolver {
         return out
     }
 
-    static func current() -> [Character: RemoteDesktopKeyStroke] {
-        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
-              let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
-        else { return [:] }
-        let data = Unmanaged<CFData>.fromOpaque(pointer).takeUnretainedValue() as Data
-        return self.resolve(layoutData: data, keyboardType: UInt32(LMGetKbdType()))
-    }
+    /// Physical key positions on a US/ANSI keyboard, as `(keyCode, unshifted, shifted)`.
+    ///
+    /// This is deliberately a fixed table rather than a lookup of the *local* layout. A client
+    /// in Scancode mode forwards key positions and the guest applies its own layout: per
+    /// Microsoft's documentation, scancode input "uses the keyboard layout of the remote
+    /// session, not the keyboard of the local device". So the question is not "which local key
+    /// produces this character" but "which position produces it on the guest", and the only
+    /// answer available without inspecting the guest is the standard ANSI arrangement.
+    ///
+    /// Deriving the map from the local layout instead would silently corrupt text whenever the
+    /// two disagree - a Cyrillic or Dvorak local layout would report characters as typeable
+    /// whose positions mean something else in the guest. Using a fixed reference means such
+    /// characters are simply absent from the map and take the lossless fallback.
+    private static let ansiKeyPositions: [(keyCode: CGKeyCode, unshifted: Character, shifted: Character)] = [
+        (0, "a", "A"), (1, "s", "S"), (2, "d", "D"), (3, "f", "F"), (4, "h", "H"),
+        (5, "g", "G"), (6, "z", "Z"), (7, "x", "X"), (8, "c", "C"), (9, "v", "V"),
+        (11, "b", "B"), (12, "q", "Q"), (13, "w", "W"), (14, "e", "E"), (15, "r", "R"),
+        (16, "y", "Y"), (17, "t", "T"), (31, "o", "O"), (32, "u", "U"), (34, "i", "I"),
+        (35, "p", "P"), (37, "l", "L"), (38, "j", "J"), (40, "k", "K"), (45, "n", "N"),
+        (46, "m", "M"),
+        (18, "1", "!"), (19, "2", "@"), (20, "3", "#"), (21, "4", "$"), (23, "5", "%"),
+        (22, "6", "^"), (26, "7", "&"), (28, "8", "*"), (25, "9", "("), (29, "0", ")"),
+        (24, "=", "+"), (27, "-", "_"), (30, "]", "}"), (33, "[", "{"), (39, "'", "\""),
+        (41, ";", ":"), (42, "\\", "|"), (43, ",", "<"), (44, "/", "?"), (47, ".", ">"),
+        (50, "`", "~"),
+    ]
 
-    static func resolve(layoutData: Data?, keyboardType: UInt32) -> [Character: RemoteDesktopKeyStroke] {
-        guard let layoutData, !layoutData.isEmpty else { return [:] }
-        return layoutData.withUnsafeBytes { bytes -> [Character: RemoteDesktopKeyStroke] in
-            guard let layout = bytes.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self) else {
-                return [:]
+    /// Character to key press, built from ``ansiKeyPositions``. Unshifted wins where a
+    /// character is reachable both ways.
+    static let ansiKeyMap: [Character: RemoteDesktopKeyStroke] = {
+        var map: [Character: RemoteDesktopKeyStroke] = [
+            " ": RemoteDesktopKeyStroke(keyCode: CGKeyCode(kVK_Space), needsShift: false),
+        ]
+        for position in Self.ansiKeyPositions {
+            if map[position.unshifted] == nil {
+                map[position.unshifted] = RemoteDesktopKeyStroke(keyCode: position.keyCode, needsShift: false)
             }
-
-            var map: [Character: RemoteDesktopKeyStroke] = [:]
-            // Unshifted first, so a character reachable both ways prefers the simpler stroke.
-            for needsShift in [false, true] {
-                let modifiers = needsShift ? UInt32(shiftKey >> 8) : 0
-                for key: UInt16 in 0..<128 {
-                    guard self.keypadKeyCodeRange.contains(key) == false,
-                          key != self.isoSectionKeyCode
-                    else { continue }
-
-                    var deadKeyState: UInt32 = 0
-                    var length = 0
-                    var characters = [UniChar](repeating: 0, count: 4)
-                    // Deliberately not `kUCKeyTranslateNoDeadKeysMask`: that mask reports a dead
-                    // key's standalone glyph, which would map e.g. `"` on US-International to a
-                    // key that actually composes the next character instead of typing a quote.
-                    let status = UCKeyTranslate(
-                        layout,
-                        key,
-                        UInt16(kUCKeyActionDisplay),
-                        modifiers,
-                        keyboardType,
-                        0,
-                        &deadKeyState,
-                        characters.count,
-                        &length,
-                        &characters
-                    )
-                    guard status == noErr, deadKeyState == 0, length == 1 else { continue }
-                    let scalarValue = characters[0]
-                    // Printable only: control codes and delete are delivered as their own keys.
-                    guard scalarValue >= 0x20, scalarValue != 0x7f,
-                          let scalar = UnicodeScalar(scalarValue)
-                    else { continue }
-                    let character = Character(scalar)
-                    if map[character] == nil {
-                        map[character] = RemoteDesktopKeyStroke(keyCode: CGKeyCode(key), needsShift: needsShift)
-                    }
-                }
+            if map[position.shifted] == nil {
+                map[position.shifted] = RemoteDesktopKeyStroke(keyCode: position.keyCode, needsShift: true)
             }
-            return map
         }
-    }
+        return map
+    }()
 
     /// Spells `text` out as key presses, or reports every character that has no key on this
     /// layout.
@@ -152,9 +138,14 @@ enum RemoteDesktopKeyMapResolver {
     /// through the client, so there is no way to confirm where keystrokes are landing before
     /// sending them. Refusing to send an activating key bounds the worst case to "wrong text
     /// typed somewhere" rather than "an action taken in the guest".
+    /// - Parameter capsLockActive: inverts shift for alphabetic characters. RDP synchronises
+    ///   lock state between client and guest (`TS_SYNCHRONIZE_EVENT`), so when Caps Lock is on
+    ///   the guest applies it to the forwarded scan codes and an unshifted `a` position arrives
+    ///   as `A`. Without this the case of every letter is inverted.
     static func plan(
         for text: String,
-        map: [Character: RemoteDesktopKeyStroke]
+        map: [Character: RemoteDesktopKeyStroke],
+        capsLockActive: Bool = false
     ) -> RemoteDesktopTypingPlan {
         var strokes: [RemoteDesktopKeyStroke] = []
         strokes.reserveCapacity(text.count)
@@ -172,76 +163,17 @@ enum RemoteDesktopKeyMapResolver {
                     if seenUnmappable.insert(character).inserted { unmappable.append(character) }
                     continue
                 }
-                strokes.append(stroke)
+                if capsLockActive, character.isLetter {
+                    strokes.append(
+                        RemoteDesktopKeyStroke(keyCode: stroke.keyCode, needsShift: !stroke.needsShift)
+                    )
+                } else {
+                    strokes.append(stroke)
+                }
             }
         }
 
         guard unmappable.isEmpty else { return .unmappable(unmappable) }
         return .strokes(strokes)
-    }
-}
-
-/// Process-wide snapshot of the layout map, refreshed at launch and on input-source changes.
-/// Mirrors `PasteKeyCodeCache`: typing requests only read the snapshot and never touch the
-/// main queue.
-final class RemoteDesktopKeyMapCache: @unchecked Sendable {
-    private let lock = NSLock()
-    private var map: [Character: RemoteDesktopKeyStroke] = [:]
-    private var observer: NSObjectProtocol?
-    private let resolve: () -> [Character: RemoteDesktopKeyStroke]
-    private let notificationName: Notification.Name
-    private var refreshScheduled = false
-
-    init(
-        notificationName: Notification.Name = Notification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
-        resolve: @escaping () -> [Character: RemoteDesktopKeyStroke] = { RemoteDesktopKeyMapResolver.current() }
-    ) {
-        self.notificationName = notificationName
-        self.resolve = resolve
-    }
-
-    func start() {
-        precondition(Thread.isMainThread)
-        guard self.observer == nil else { return }
-        self.observer = DistributedNotificationCenter.default().addObserver(
-            forName: self.notificationName,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.scheduleRefresh()
-        }
-        self.refresh()
-    }
-
-    private func scheduleRefresh() {
-        precondition(Thread.isMainThread)
-        guard !self.refreshScheduled else { return }
-        self.refreshScheduled = true
-        // Let TIS process the source-change event before reading its current layout.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.refreshScheduled = false
-            self.refresh()
-        }
-    }
-
-    private func refresh() {
-        precondition(Thread.isMainThread)
-        let updated = self.resolve()
-        self.lock.lock()
-        self.map = updated
-        self.lock.unlock()
-    }
-
-    func snapshot() -> [Character: RemoteDesktopKeyStroke] {
-        self.lock.lock()
-        defer { self.lock.unlock() }
-        return self.map
-    }
-
-    deinit {
-        if let observer {
-            DistributedNotificationCenter.default().removeObserver(observer)
-        }
     }
 }
