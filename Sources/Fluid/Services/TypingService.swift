@@ -717,7 +717,8 @@ final class TypingService {
                       self.postReturnKey(
                           postInsertionKey,
                           targetPID: preferredTargetPID,
-                          resetKeyboardState: hasTextToInsert == false
+                          resetKeyboardState: hasTextToInsert == false,
+                          requiredFocusTarget: requiredFocusTarget
                       )
                 else {
                     outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
@@ -894,7 +895,8 @@ final class TypingService {
     private func postReturnKey(
         _ key: SettingsStore.SpokenSendKey,
         targetPID: pid_t,
-        resetKeyboardState: Bool
+        resetKeyboardState: Bool,
+        requiredFocusTarget: CapturedFocusTarget?
     ) -> Bool {
         let returnKeyCode = CGKeyCode(kVK_Return)
 
@@ -917,8 +919,21 @@ final class TypingService {
                 // The reset sleeps for well over 150ms and posts Escape globally, so the
                 // destination has to be re-confirmed before Return - which activates whatever
                 // now holds focus - rather than trusting the check made before the reset.
+                //
+                // The PID alone is not enough here: it cannot tell one connection window or
+                // field of this client from another, and Return submits whatever it lands on.
+                // So the exact element is required, matching the check the caller makes before
+                // this and the one the typing path makes after its own reset.
                 guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
                     self.log("[TypingService] ERROR: Target lost focus during the keyboard reset; not sending \(key.displayName)")
+                    return false
+                }
+                guard let requiredFocusTarget else {
+                    self.log("[TypingService] ERROR: No focus target to re-confirm after the keyboard reset; not sending \(key.displayName)")
+                    return false
+                }
+                guard Self.isExactFocusTargetActive(requiredFocusTarget) else {
+                    self.log("[TypingService] ERROR: Focused element changed during the keyboard reset; not sending \(key.displayName)")
                     return false
                 }
             }
