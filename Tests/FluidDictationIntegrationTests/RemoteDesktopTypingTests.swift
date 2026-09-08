@@ -179,6 +179,19 @@ final class RemoteDesktopTypingTests: XCTestCase {
         XCTAssertEqual(map[" "]?.needsShift, false)
     }
 
+    // MARK: - Paste chord position
+
+    func testPasteChordUsesTheGuestPositionForV() {
+        // The chord is forwarded to the guest as scan codes, so it must use the position 'v'
+        // occupies on the guest, not the local Command+V shortcut key. On a Dvorak local layout
+        // PasteKeyCodeResolver returns 47 while the ANSI position of 'v' is 9.
+        XCTAssertEqual(RemoteDesktopKeyMapResolver.ansiPasteKeyCode, 9)
+        XCTAssertEqual(
+            RemoteDesktopKeyMapResolver.ansiKeyMap["v"],
+            RemoteDesktopKeyStroke(keyCode: 9, needsShift: false)
+        )
+    }
+
     // MARK: - Caps Lock
 
     func testCapsLockInvertsShiftForLettersOnly() {

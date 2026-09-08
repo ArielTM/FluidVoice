@@ -2080,6 +2080,9 @@ struct ContentView: View {
     private func captureRecordingTargetContext() {
         // Capture the focused target PID BEFORE any overlay/UI changes.
         // Used to restore focus when the user interacts with overlay dropdowns.
+        // Sampled here because the hotkey's modifiers are still held at recording start; by
+        // insertion time they have been released and cannot be observed.
+        TypingService.noteDictationHotkeyModifiers()
         let focusTarget = TypingService.captureSystemFocusTarget()
         self.recordingFocusTarget = focusTarget
         let focusedPID = focusTarget?.pid

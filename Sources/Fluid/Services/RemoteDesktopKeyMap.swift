@@ -105,6 +105,16 @@ enum RemoteDesktopKeyMapResolver {
         (50, "`", "~"),
     ]
 
+    /// The ANSI position of `v`, for a Ctrl+V chord forwarded to the guest.
+    ///
+    /// Deliberately not `PasteKeyCodeResolver`, which answers a different question: that
+    /// resolves the *local* Command+V shortcut, which the client handles itself. A chord
+    /// forwarded to the guest as scan codes has to use the position `v` occupies on the guest,
+    /// so on a Dvorak local layout the two differ and the local answer is wrong here.
+    static var ansiPasteKeyCode: CGKeyCode {
+        self.ansiKeyMap["v"]?.keyCode ?? 9
+    }
+
     /// Character to key press, built from ``ansiKeyPositions``. Unshifted wins where a
     /// character is reachable both ways.
     static let ansiKeyMap: [Character: RemoteDesktopKeyStroke] = {

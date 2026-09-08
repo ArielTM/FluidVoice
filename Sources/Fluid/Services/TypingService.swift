@@ -123,6 +123,10 @@ final class TypingService {
     private static let pasteboardSessionSemaphore = DispatchSemaphore(value: 1)
     private static let pasteboardRestoreQueue = DispatchQueue(label: "TypingService.PasteboardRestore", qos: .utility)
     private static var focusSnapshot: FocusSnapshot?
+
+    /// Modifier flags observed when dictation started, used to decide whether the guest may
+    /// have been left in a menu state. `nil` when nothing recorded it for this dictation.
+    private static var dictationHotkeyModifiers: CGEventFlags?
     private static let ghosttyBundleIdentifier = "com.mitchellh.ghostty"
 
     /// Windows App, formerly Microsoft Remote Desktop. Both ship this bundle identifier.
@@ -249,6 +253,21 @@ final class TypingService {
 
     /// Best-effort: returns the PID owning the currently focused accessibility element.
     /// This is more reliable than NSWorkspace.frontmostApplication for floating overlays/launchers.
+    /// Records the modifiers held as dictation begins.
+    ///
+    /// Called at recording start, before any overlay or focus changes. The hotkey's own
+    /// modifiers are still down at that point, which is the only moment they can be observed -
+    /// by insertion time they have been released, and the *configured* shortcut list cannot
+    /// say which of several shortcuts actually fired, or whether a mouse shortcut was used.
+    nonisolated static func noteDictationHotkeyModifiers() {
+        let flags = CGEventSource.flagsState(.combinedSessionState)
+        self.focusSnapshotQueue.sync { self.dictationHotkeyModifiers = flags }
+    }
+
+    private static func recordedDictationHotkeyModifiers() -> CGEventFlags? {
+        self.focusSnapshotQueue.sync { self.dictationHotkeyModifiers }
+    }
+
     static func captureSystemFocusTarget() -> CapturedFocusTarget? {
         // Accessibility is required to query system-focused AX element.
         guard AXIsProcessTrusted() else {
@@ -664,7 +683,11 @@ final class TypingService {
 
                 usleep(50_000)
                 guard Self.isExactFocusTargetActive(requiredFocusTarget),
-                      self.postReturnKey(postInsertionKey, targetPID: preferredTargetPID)
+                      self.postReturnKey(
+                          postInsertionKey,
+                          targetPID: preferredTargetPID,
+                          resetKeyboardState: hasTextToInsert == false
+                      )
                 else {
                     outcome = hasTextToInsert ? .insertedActionSuppressed : .actionSuppressed
                     return
@@ -833,7 +856,15 @@ final class TypingService {
         return false
     }
 
-    private func postReturnKey(_ key: SettingsStore.SpokenSendKey, targetPID: pid_t) -> Bool {
+    /// - Parameter resetKeyboardState: only for the action-only path, where no text was
+    ///   inserted and the typing path's reset therefore never ran. After text *has* been typed
+    ///   the guest is already out of menu mode, and an Escape there would dismiss the control
+    ///   that is about to receive Return - cancelling an autocomplete, or reverting a field.
+    private func postReturnKey(
+        _ key: SettingsStore.SpokenSendKey,
+        targetPID: pid_t,
+        resetKeyboardState: Bool
+    ) -> Bool {
         let returnKeyCode = CGKeyCode(kVK_Return)
 
         // Remote-desktop clients do not act on `postToPid` keyboard events, so a Spoken Send
@@ -850,10 +881,9 @@ final class TypingService {
                 return false
             }
 
-            // Reached without any preceding insertion when the transcript was only the send
-            // phrase, in which case the typing path's reset never ran and the guest may still
-            // be in menu mode - where Return activates a menu item instead of submitting.
-            self.resyncRemoteDesktopKeyboardState()
+            if resetKeyboardState {
+                self.resyncRemoteDesktopKeyboardState()
+            }
             self.log("[TypingService] Spoken Send: posting \(key.displayName) chord via HID tap for remote-desktop target")
             self.postRemoteDesktopChord(chord)
             return true
@@ -1379,6 +1409,16 @@ final class TypingService {
     /// other hotkey an unconditional Escape would be a gratuitous keypress into the guest, where
     /// it can cancel a dialog or abandon an in-progress operation.
     private var remoteDesktopHotkeyCanEnterMenuMode: Bool {
+        // Prefer what was actually held when this dictation started. Asking whether *any*
+        // configured shortcut uses Option or Command would send Escape for a dictation begun
+        // with a mouse or a plain-key shortcut, where there is no menu to dismiss.
+        if let observed = Self.recordedDictationHotkeyModifiers() {
+            return observed.contains(.maskAlternate) || observed.contains(.maskCommand)
+        }
+
+        // Nothing recorded (a caller that does not go through the recording path). Fall back to
+        // the configured shortcuts, which is over-broad but keeps the first character from being
+        // eaten when a menu really was opened.
         let shortcuts = SettingsStore.shared.primaryDictationShortcuts
         guard shortcuts.isEmpty == false else { return true }
         return shortcuts.contains { shortcut in
@@ -1506,7 +1546,7 @@ final class TypingService {
 
             guard let chord = Self.makeRemoteDesktopChord(
                 modifierKeyCode: CGKeyCode(kVK_Control),
-                keyCode: Self.pasteVirtualKeyCode
+                keyCode: RemoteDesktopKeyMapResolver.ansiPasteKeyCode
             ) else {
                 self.log("[TypingService] ERROR: Failed to create remote-desktop paste chord")
                 return false
