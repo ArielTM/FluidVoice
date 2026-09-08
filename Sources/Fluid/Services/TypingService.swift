@@ -1255,13 +1255,19 @@ final class TypingService {
         return chord
     }
 
-    /// The modifier key code that produces `key`'s flags as a real chord, so a remote-desktop
-    /// client has a modifier scan code to forward. Returns nil for plain Return.
+    /// The modifier key code that produces `key`'s intent as a real chord in the *guest*, so a
+    /// remote-desktop client has a modifier scan code to forward. Returns nil for plain Return.
+    ///
+    /// Command is deliberately translated to Control rather than forwarded as-is. The client
+    /// forwards the Command position as the Windows key, so a literal Command+Enter arrives as
+    /// Win+Enter - which is an operating-system shortcut in Windows and never submits. Control
+    /// is the modifier that carries the same meaning in the guest, and is the mapping the client
+    /// itself applies for copy, cut and paste.
     nonisolated static func spokenSendModifierKeyCode(for key: SettingsStore.SpokenSendKey) -> CGKeyCode? {
         switch key {
         case .enter: nil
         case .shiftEnter: CGKeyCode(kVK_Shift)
-        case .commandEnter: CGKeyCode(kVK_Command)
+        case .commandEnter: CGKeyCode(kVK_Control)
         }
     }
 
@@ -1562,9 +1568,14 @@ final class TypingService {
                 return false
             }
 
+            guard let pasteKeyCode = RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode() else {
+                self.log("[TypingService] ERROR: No agreed position for the paste key; refusing to press an unknown key")
+                return false
+            }
+
             guard let chord = Self.makeRemoteDesktopChord(
                 modifierKeyCode: CGKeyCode(kVK_Control),
-                keyCode: RemoteDesktopKeyMapResolver.ansiPasteKeyCode
+                keyCode: pasteKeyCode
             ) else {
                 self.log("[TypingService] ERROR: Failed to create remote-desktop paste chord")
                 return false

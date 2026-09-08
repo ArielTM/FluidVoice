@@ -208,15 +208,22 @@ final class RemoteDesktopTypingTests: XCTestCase {
 
     // MARK: - Paste chord position
 
-    func testPasteChordUsesTheGuestPositionForV() {
-        // The chord is forwarded to the guest as scan codes, so it must use the position 'v'
-        // occupies on the guest, not the local Command+V shortcut key. On a Dvorak local layout
-        // PasteKeyCodeResolver returns 47 while the ANSI position of 'v' is 9.
-        XCTAssertEqual(RemoteDesktopKeyMapResolver.ansiPasteKeyCode, 9)
-        XCTAssertEqual(
-            RemoteDesktopKeyMapResolver.ansiKeyMap["v"],
-            RemoteDesktopKeyStroke(keyCode: 9, needsShift: false)
-        )
+    func testPasteChordKeyMustSurviveLayoutAgreement() {
+        // Forwarded as a scan code and translated by the guest, so it is subject to the same
+        // ambiguity as the typing map: it must be a position both readings agree on, or nil.
+        let safe = RemoteDesktopKeyMapResolver.layoutSafeMap()
+        XCTAssertEqual(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(), safe["v"]?.keyCode)
+        if safe["v"] != nil {
+            XCTAssertEqual(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(), 9,
+                           "on an agreeing Latin layout that is the ANSI position")
+        }
+    }
+
+    func testLayoutSafeMapFailsClosedWhenTheLocalLayoutIsUnreadable() {
+        // An unknown layout cannot establish agreement, so it must yield nothing rather than
+        // falling open to the full ANSI map.
+        XCTAssertTrue(RemoteDesktopKeyMapResolver.localLayoutMap(layoutData: nil, keyboardType: 0).isEmpty)
+        XCTAssertTrue(RemoteDesktopKeyMapResolver.localLayoutMap(layoutData: Data(), keyboardType: 0).isEmpty)
     }
 
     // MARK: - Caps Lock

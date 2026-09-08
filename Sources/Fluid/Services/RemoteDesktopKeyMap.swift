@@ -105,14 +105,18 @@ enum RemoteDesktopKeyMapResolver {
         (50, "`", "~"),
     ]
 
-    /// The ANSI position of `v`, for a Ctrl+V chord forwarded to the guest.
+    /// The position to press for `v` in a Ctrl+V chord forwarded to the guest, or nil when no
+    /// position can be trusted.
     ///
     /// Deliberately not `PasteKeyCodeResolver`, which answers a different question: that
-    /// resolves the *local* Command+V shortcut, which the client handles itself. A chord
-    /// forwarded to the guest as scan codes has to use the position `v` occupies on the guest,
-    /// so on a Dvorak local layout the two differ and the local answer is wrong here.
-    static var ansiPasteKeyCode: CGKeyCode {
-        self.ansiKeyMap["v"]?.keyCode ?? 9
+    /// resolves the *local* Command+V shortcut, which the client handles itself. This chord is
+    /// forwarded as a scan code and translated by the guest, so it is subject to exactly the
+    /// same ambiguity as ``layoutSafeMap`` - on a Dvorak guest the ANSI position of `v` is a
+    /// different letter, and Ctrl plus that letter may be an unrelated shortcut. So the position
+    /// has to be one both readings agree on, and when they do not, the caller declines rather
+    /// than pressing something unknown.
+    static func layoutSafePasteKeyCode() -> CGKeyCode? {
+        self.layoutSafeMap()["v"]?.keyCode
     }
 
     /// Character to key press, built from ``ansiKeyPositions``. Unshifted wins where a
@@ -146,9 +150,13 @@ enum RemoteDesktopKeyMapResolver {
     /// or ABC layout that is all of printable ASCII; on AZERTY the transposed keys drop out and
     /// take the lossless fallback instead of being silently mistyped. The guest's layout cannot
     /// be interrogated through the client, so agreement is the strongest guarantee available.
+    /// Fails closed: when the local layout cannot be read, no agreement can be established, so
+    /// nothing is offered for direct typing and the caller takes the lossless path. Returning
+    /// the full ANSI map here would mean a transient input-source lookup failure silently
+    /// changed correct behaviour into mistyped text on a non-ANSI setup.
     static func layoutSafeMap() -> [Character: RemoteDesktopKeyStroke] {
         let local = self.localLayoutMap()
-        guard local.isEmpty == false else { return self.ansiKeyMap }
+        guard local.isEmpty == false else { return [:] }
         return self.ansiKeyMap.filter { character, ansiStroke in local[character] == ansiStroke }
     }
 

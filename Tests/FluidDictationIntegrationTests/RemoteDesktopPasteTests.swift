@@ -182,7 +182,12 @@ final class RemoteDesktopPasteTests: XCTestCase {
     func testSpokenSendModifiersMapToRealModifierKeyCodes() {
         XCTAssertNil(TypingService.spokenSendModifierKeyCode(for: .enter))
         XCTAssertEqual(TypingService.spokenSendModifierKeyCode(for: .shiftEnter), CGKeyCode(kVK_Shift))
-        XCTAssertEqual(TypingService.spokenSendModifierKeyCode(for: .commandEnter), CGKeyCode(kVK_Command))
+        // Command is translated to Control, not forwarded literally: the client forwards the
+        // Command position as the Windows key, so Command+Enter would arrive as Win+Enter - an
+        // operating-system shortcut that never submits. Control carries the same meaning in the
+        // guest and is the mapping the client itself applies for copy, cut and paste.
+        XCTAssertEqual(TypingService.spokenSendModifierKeyCode(for: .commandEnter), CGKeyCode(kVK_Control))
+        XCTAssertNotEqual(TypingService.spokenSendModifierKeyCode(for: .commandEnter), CGKeyCode(kVK_Command))
     }
 
     func testShiftEnterProducesAShiftChordRatherThanABareReturn() throws {
