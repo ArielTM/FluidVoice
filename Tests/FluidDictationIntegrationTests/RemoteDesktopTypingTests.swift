@@ -185,7 +185,7 @@ final class RemoteDesktopTypingTests: XCTestCase {
         // A guest may mirror the local layout (RDP's default) or be plain ANSI. Only characters
         // whose position is identical under both are safe; the rest must take the lossless path.
         let ansi = RemoteDesktopKeyMapResolver.ansiKeyMap
-        let safe = RemoteDesktopKeyMapResolver.layoutSafeMap()
+        let safe = RemoteDesktopKeyMapResolver.currentLayoutSafeMap()
 
         XCTAssertFalse(safe.isEmpty, "a Latin layout must retain a usable set")
         for (character, stroke) in safe {
@@ -211,10 +211,10 @@ final class RemoteDesktopTypingTests: XCTestCase {
     func testPasteChordKeyMustSurviveLayoutAgreement() {
         // Forwarded as a scan code and translated by the guest, so it is subject to the same
         // ambiguity as the typing map: it must be a position both readings agree on, or nil.
-        let safe = RemoteDesktopKeyMapResolver.layoutSafeMap()
-        XCTAssertEqual(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(), safe["v"]?.keyCode)
+        let safe = RemoteDesktopKeyMapResolver.currentLayoutSafeMap()
+        XCTAssertEqual(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(map: safe), safe["v"]?.keyCode)
         if safe["v"] != nil {
-            XCTAssertEqual(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(), 9,
+            XCTAssertEqual(RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(map: safe), 9,
                            "on an agreeing Latin layout that is the ANSI position")
         }
     }

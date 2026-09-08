@@ -225,15 +225,33 @@ final class TypingService {
 
     // MARK: - Layout-aware key code lookup
 
-    private static let pasteKeyCache = PasteKeyCodeCache {
+    private static let pasteKeyCache = KeyboardLayoutSnapshotCache(initialValue: CGKeyCode(9)) {
         let key = PasteKeyCodeResolver.current()
         DebugLogger.shared.benchmark("TYPING_BENCH", message: "paste_key_cache_refresh keyCode=\(key)", source: "TypingBenchmark")
         return key
     }
 
+    /// The characters that can be typed into a remote-desktop session on the active layout.
+    ///
+    /// Snapshotted for the same reason as the paste key code, but the consequence of getting it
+    /// wrong is worse: the remote-desktop typing path runs on a background queue, and resolving
+    /// this inline there reads the input source off the main thread, which can trap inside
+    /// HIToolbox and kill the app mid-dictation.
+    ///
+    /// Starts empty so that a cache which never started declines to type rather than typing from
+    /// a layout it has not actually read.
+    private static let remoteDesktopLayoutCache = KeyboardLayoutSnapshotCache(
+        initialValue: [Character: RemoteDesktopKeyStroke]()
+    ) {
+        let map = RemoteDesktopKeyMapResolver.currentLayoutSafeMap()
+        DebugLogger.shared.benchmark("TYPING_BENCH", message: "remote_layout_cache_refresh characters=\(map.count)", source: "TypingBenchmark")
+        return map
+    }
+
     /// Called during application launch, before any paste requests can arrive.
     static func startKeyboardLayoutTracking() {
         self.pasteKeyCache.start()
+        self.remoteDesktopLayoutCache.start()
     }
 
     /// The virtual key code for "v" in the current keyboard layout (used for Cmd+V paste).
@@ -1309,7 +1327,12 @@ final class TypingService {
         targetPID: pid_t
     ) -> RemoteDesktopTypingOutcome {
         let normalized = RemoteDesktopKeyMapResolver.transliterate(text)
-        let map = RemoteDesktopKeyMapResolver.layoutSafeMap()
+        // Snapshot, never a live lookup: this runs on a background queue and reading the input
+        // source from here can trap inside HIToolbox.
+        let map = Self.remoteDesktopLayoutCache.snapshot()
+        if map.isEmpty {
+            self.log("[TypingService] ERROR: Layout snapshot is empty - nothing can be typed or pasted into this session. Either layout tracking never started, or the local layout shares no positions with ANSI.")
+        }
 
         let strokes: [RemoteDesktopKeyStroke]
         let capsLockActive = CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift)
@@ -1568,7 +1591,9 @@ final class TypingService {
                 return false
             }
 
-            guard let pasteKeyCode = RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode() else {
+            guard let pasteKeyCode = RemoteDesktopKeyMapResolver.layoutSafePasteKeyCode(
+                map: Self.remoteDesktopLayoutCache.snapshot()
+            ) else {
                 self.log("[TypingService] ERROR: No agreed position for the paste key; refusing to press an unknown key")
                 return false
             }

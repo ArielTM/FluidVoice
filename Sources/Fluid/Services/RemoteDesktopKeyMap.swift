@@ -115,8 +115,8 @@ enum RemoteDesktopKeyMapResolver {
     /// different letter, and Ctrl plus that letter may be an unrelated shortcut. So the position
     /// has to be one both readings agree on, and when they do not, the caller declines rather
     /// than pressing something unknown.
-    static func layoutSafePasteKeyCode() -> CGKeyCode? {
-        self.layoutSafeMap()["v"]?.keyCode
+    static func layoutSafePasteKeyCode(map: [Character: RemoteDesktopKeyStroke]) -> CGKeyCode? {
+        map["v"]?.keyCode
     }
 
     /// Character to key press, built from ``ansiKeyPositions``. Unshifted wins where a
@@ -154,8 +154,17 @@ enum RemoteDesktopKeyMapResolver {
     /// nothing is offered for direct typing and the caller takes the lossless path. Returning
     /// the full ANSI map here would mean a transient input-source lookup failure silently
     /// changed correct behaviour into mistyped text on a non-ANSI setup.
-    static func layoutSafeMap() -> [Character: RemoteDesktopKeyStroke] {
-        let local = self.localLayoutMap()
+    /// Resolves the active layout and applies ``layoutSafeMap(local:)``.
+    ///
+    /// Main thread only, because it reads the input source - see ``localLayoutMap()``. This is
+    /// the resolve closure for the process-wide snapshot; the typing path reads that snapshot
+    /// rather than calling this, so it never touches Carbon off the main thread.
+    static func currentLayoutSafeMap() -> [Character: RemoteDesktopKeyStroke] {
+        self.layoutSafeMap(local: self.localLayoutMap())
+    }
+
+    /// Pure form: the agreement filter, given an already-resolved local layout.
+    static func layoutSafeMap(local: [Character: RemoteDesktopKeyStroke]) -> [Character: RemoteDesktopKeyStroke] {
         guard local.isEmpty == false else { return [:] }
         return self.ansiKeyMap.filter { character, ansiStroke in local[character] == ansiStroke }
     }
@@ -163,7 +172,13 @@ enum RemoteDesktopKeyMapResolver {
     /// The active layout's own character-to-position map, used only to confirm agreement with
     /// ``ansiKeyMap``. Dead keys are excluded: they compose the following character rather than
     /// emitting a glyph, so treating them as typeable would corrupt text.
+    /// Main thread only. `TISGetInputSourceProperty` validates the source against HIToolbox's
+    /// input-source list, and rebuilding that list asserts the main queue - so calling this from
+    /// a background queue can trap inside HIToolbox with no frame of ours on the stack. The
+    /// precondition mirrors ``PasteKeyCodeResolver/current()`` and fails at the real call site
+    /// instead. Off-main callers want the cached snapshot, not this.
     static func localLayoutMap() -> [Character: RemoteDesktopKeyStroke] {
+        precondition(Thread.isMainThread)
         guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
               let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
         else { return [:] }
