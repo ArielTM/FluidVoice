@@ -154,6 +154,39 @@ final class TypingService {
     static let remoteDesktopTypeDelayOverrideKey = "RemoteDesktopTypeDelayMs"
     static let remoteDesktopFocusRecheckInterval = 10
 
+    static let remoteDesktopWarmupDefaultMs = 250
+    static let remoteDesktopWarmupMaximumMs = 3000
+    static let remoteDesktopWarmupOverrideKey = "RemoteDesktopWarmupMs"
+
+    /// Pause between releasing the hotkey's modifiers and the first typed character.
+    ///
+    /// `waitForPhysicalModifiersToRelease` only observes the *local* flag state. The client
+    /// still has to forward the modifier release across the remote keyboard channel, and until
+    /// the guest processes it the guest believes the modifier is held - so the first character
+    /// arrives as a modifier chord (`Alt+a` is a menu accelerator, which inserts nothing) and is
+    /// lost. This is the dropped-leading-character behaviour reported in discussion #563.
+    ///
+    /// Overridable via the `RemoteDesktopWarmupMs` user default (no Settings UI).
+    nonisolated static func remoteDesktopWarmupMicros(override: NSNumber?) -> useconds_t {
+        let requested = override.map(\.intValue) ?? self.remoteDesktopWarmupDefaultMs
+        let clamped = min(max(0, requested), self.remoteDesktopWarmupMaximumMs)
+        return useconds_t(clamped * 1000)
+    }
+
+    private static var remoteDesktopWarmup: useconds_t {
+        self.remoteDesktopWarmupMicros(
+            override: UserDefaults.standard.object(forKey: self.remoteDesktopWarmupOverrideKey) as? NSNumber
+        )
+    }
+
+    /// Modifier key codes explicitly released before typing into a remote session.
+    private static let remoteDesktopResyncModifierKeyCodes: [CGKeyCode] = [
+        CGKeyCode(kVK_Shift), CGKeyCode(kVK_RightShift),
+        CGKeyCode(kVK_Control), CGKeyCode(kVK_RightControl),
+        CGKeyCode(kVK_Option), CGKeyCode(kVK_RightOption),
+        CGKeyCode(kVK_Command), CGKeyCode(kVK_RightCommand),
+    ]
+
     /// Pause after each character when typing into a remote-desktop session. The remote
     /// keyboard channel drops characters if they arrive faster than it forwards them.
     /// Overridable via the `RemoteDesktopTypeDelayMs` user default (no Settings UI).
@@ -1256,6 +1289,18 @@ final class TypingService {
             return .declined
         }
 
+        // The hotkey that started this dictation is very often a modifier (the default is
+        // modifier-only), and the client forwards that modifier's press and release to the guest
+        // independently. Until the guest processes the release it still believes the modifier is
+        // held, so post an explicit release for every modifier and then wait before typing.
+        // Without this the first character arrives as a modifier chord and is swallowed.
+        self.resyncRemoteDesktopModifiers()
+        let warmupMicros = Self.remoteDesktopWarmup
+        if warmupMicros > 0 {
+            self.log("[TypingService] Warming up remote keyboard channel for \(warmupMicros / 1000)ms")
+            usleep(warmupMicros)
+        }
+
         // Built up front for two reasons: a creation failure aborts before anything is typed,
         // and a nil-source CGEvent captures the combined-session modifier flags at creation, so
         // building them all now - after the modifier wait - guarantees every event carries clean
@@ -1292,6 +1337,24 @@ final class TypingService {
 
         self.log("[TypingService] Remote-desktop typing completed")
         return .typed
+    }
+
+    /// Posts a release for every modifier so the guest cannot be left believing one is held.
+    ///
+    /// A latched modifier in the guest is worse than a lost character: every subsequent letter
+    /// becomes a chord, and `Alt+<letter>` walks the focused application's menus rather than
+    /// inserting text.
+    private func resyncRemoteDesktopModifiers() {
+        for keyCode in Self.remoteDesktopResyncModifierKeyCodes {
+            guard let release = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+                continue
+            }
+            // Created as a `flagsChanged` already; only the tag is added so FluidVoice's own
+            // event tap ignores it.
+            release.setIntegerValueField(.eventSourceUserData, value: Self.synthesizedEventUserData)
+            release.post(tap: .cghidEventTap)
+        }
+        self.log("[TypingService] Posted modifier resync before remote-desktop typing")
     }
 
     private func isRemoteDesktopTargetStillFrontmost(_ targetPID: pid_t) -> Bool {

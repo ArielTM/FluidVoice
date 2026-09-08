@@ -69,17 +69,19 @@ final class RemoteDesktopTypingTests: XCTestCase {
         XCTAssertEqual(strokes.map(\.needsShift), [false, true, false])
     }
 
-    func testNewlinesAndTabsUseTheirOwnKeysRatherThanTheLayoutMap() throws {
-        let strokes = try XCTUnwrap(
-            self.strokes("a\nb\tb\r")
-        )
-        XCTAssertEqual(
-            strokes.map(\.keyCode),
-            [0, CGKeyCode(kVK_Return), 11, CGKeyCode(kVK_Tab), 11, CGKeyCode(kVK_Return)]
-        )
-        // Newline is Shift+Return: a bare Return submits in most chat clients, so a
-        // multi-paragraph transcript typed with Return would send one partial message per line.
-        XCTAssertEqual(strokes.map(\.needsShift), [false, true, false, false, false, true])
+    func testReturnAndTabAreNeverTypedIntoARemoteSession() throws {
+        // Return commits and Tab moves focus. Every other key this path can press only inserts
+        // a character, so refusing these bounds the worst case to wrong text rather than an
+        // action taken inside the guest.
+        for activating in ["a\nb", "a\r\nb", "a\tb", "a\rb"] {
+            XCTAssertNil(
+                self.strokes(activating),
+                "\(activating.debugDescription) must not be typed"
+            )
+        }
+        XCTAssertEqual(self.unmappable("a\nb"), ["\n"])
+        XCTAssertEqual(self.unmappable("a\r\nb"), ["\r\n"])
+        XCTAssertEqual(self.unmappable("a\tb"), ["\t"])
     }
 
     func testMappingIsAllOrNothing() {
@@ -114,9 +116,12 @@ final class RemoteDesktopTypingTests: XCTestCase {
         XCTAssertEqual(found, ["c", "f", "\u{00E9}", "l", "i", "r", "\u{1F600}"])
     }
 
-    func testWhitespaceControlCharactersAreNotReportedAsUnmappable() {
-        XCTAssertNil(self.unmappable("a\nb\tb\r"), "Newlines and tabs have their own keys")
-        XCTAssertNil(self.unmappable("a\r\nb"), "CRLF is one grapheme cluster and must still map")
+    func testActivatingWhitespaceIsReportedAsUnmappable() {
+        XCTAssertEqual(
+            self.unmappable("a\nb\tb\r"),
+            ["\n", "\t", "\r"],
+            "Activating keys are reported so the caller falls back rather than pressing them"
+        )
     }
 
     // MARK: - Layout resolution
@@ -215,5 +220,19 @@ final class RemoteDesktopTypingTests: XCTestCase {
         let maximum = useconds_t(TypingService.remoteDesktopTypeDelayMaximumMs * 1000)
         XCTAssertEqual(TypingService.remoteDesktopTypeDelayMicros(override: NSNumber(value: Int32.max)), maximum)
         XCTAssertEqual(TypingService.remoteDesktopTypeDelayMicros(override: NSNumber(value: -5)), 0)
+    }
+    // MARK: - Warm-up parsing
+
+    func testWarmupDefaultsAndClamps() {
+        XCTAssertEqual(
+            TypingService.remoteDesktopWarmupMicros(override: nil),
+            useconds_t(TypingService.remoteDesktopWarmupDefaultMs * 1000)
+        )
+        XCTAssertEqual(TypingService.remoteDesktopWarmupMicros(override: NSNumber(value: 500)), 500_000)
+        XCTAssertEqual(TypingService.remoteDesktopWarmupMicros(override: NSNumber(value: 0)), 0)
+
+        let maximum = useconds_t(TypingService.remoteDesktopWarmupMaximumMs * 1000)
+        XCTAssertEqual(TypingService.remoteDesktopWarmupMicros(override: NSNumber(value: Int32.max)), maximum)
+        XCTAssertEqual(TypingService.remoteDesktopWarmupMicros(override: NSNumber(value: -1)), 0)
     }
 }

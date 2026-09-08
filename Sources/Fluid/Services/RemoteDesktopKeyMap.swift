@@ -142,10 +142,16 @@ enum RemoteDesktopKeyMapResolver {
     /// All-or-nothing on purpose: a partially typed transcript is worse than none, so the caller
     /// falls back rather than emitting a prefix.
     ///
-    /// Newline is typed as **Shift+Return**, not Return. A bare Return submits in most chat
-    /// clients, so a multi-paragraph transcript typed with Return would send one partial message
-    /// per line; Shift+Return is a line break in every mainstream chat client and a soft break
-    /// in word processors.
+    /// Return and Tab are deliberately **never typed** into a remote session; text containing
+    /// them is reported as unmappable instead.
+    ///
+    /// Every other key this can press (codes 0-50: letters, digits, punctuation) only inserts a
+    /// character. Return *commits* and Tab *moves focus*, so if the guest's focus is not a text
+    /// field - a dialog, a menu, a search field - a transcript containing a newline can activate
+    /// whatever happens to be highlighted. The guest exposes no accessibility information
+    /// through the client, so there is no way to confirm where keystrokes are landing before
+    /// sending them. Refusing to send an activating key bounds the worst case to "wrong text
+    /// typed somewhere" rather than "an action taken in the guest".
     static func plan(
         for text: String,
         map: [Character: RemoteDesktopKeyStroke]
@@ -157,12 +163,10 @@ enum RemoteDesktopKeyMapResolver {
 
         for character in text {
             switch character {
-            case "\n", "\r", "\r\n":
-                // "\r\n" is a single grapheme cluster in Swift and is not equal to "\n",
-                // so it has to be matched explicitly.
-                strokes.append(RemoteDesktopKeyStroke(keyCode: CGKeyCode(kVK_Return), needsShift: true))
-            case "\t":
-                strokes.append(RemoteDesktopKeyStroke(keyCode: CGKeyCode(kVK_Tab), needsShift: false))
+            case "\n", "\r", "\r\n", "\t":
+                // Never typed - see the note above. "\r\n" is a single grapheme cluster in
+                // Swift and is not equal to "\n", so it has to be matched explicitly.
+                if seenUnmappable.insert(character).inserted { unmappable.append(character) }
             default:
                 guard let stroke = map[character] else {
                     if seenUnmappable.insert(character).inserted { unmappable.append(character) }
