@@ -86,8 +86,10 @@ enum RemoteDesktopLayoutCacheRegressionTests {
         // The agreement filter itself stays pure and testable without touching Carbon.
         precondition(RemoteDesktopKeyMapResolver.layoutSafeMap(local: [:]).isEmpty,
                      "no local layout means no agreement")
-        let ansiV = RemoteDesktopKeyMapResolver.ansiKeyMap["v"]
-        precondition(RemoteDesktopKeyMapResolver.layoutSafeMap(local: ["v": ansiV!])["v"] == ansiV,
+        guard let ansiV = RemoteDesktopKeyMapResolver.ansiKeyMap["v"] else {
+            fatalError("the ANSI table must define a position for v")
+        }
+        precondition(RemoteDesktopKeyMapResolver.layoutSafeMap(local: ["v": ansiV])["v"] == ansiV,
                      "an agreeing position survives the filter")
         precondition(RemoteDesktopKeyMapResolver.layoutSafeMap(local: ["v": stroke(47)])["v"] == nil,
                      "a disagreeing position is dropped")

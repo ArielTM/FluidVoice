@@ -220,8 +220,8 @@ final class RemoteDesktopTypingTests: XCTestCase {
         }
     }
 
-    func testPasteChordFallsBackToAnsiOnlyForNonLatinLayouts() {
-        let ansiV = RemoteDesktopKeyMapResolver.ansiKeyMap["v"]!
+    func testPasteChordFallsBackToAnsiOnlyForNonLatinLayouts() throws {
+        let ansiV = try XCTUnwrap(RemoteDesktopKeyMapResolver.ansiKeyMap["v"])
 
         // A non-Latin layout has no `v` to disagree about: the guest's Latin sublayout puts it
         // where ANSI does, so the lossless paste stays available instead of inserting nothing.
