@@ -179,6 +179,9 @@ final class TypingService {
         )
     }
 
+    /// Pause between the modifier releases and the Escape that exits Windows menu mode.
+    static let remoteDesktopEscapeGapMicros: useconds_t = 150_000
+
     /// Modifier key codes explicitly released before typing into a remote session.
     private static let remoteDesktopResyncModifierKeyCodes: [CGKeyCode] = [
         CGKeyCode(kVK_Shift), CGKeyCode(kVK_RightShift),
@@ -1294,7 +1297,7 @@ final class TypingService {
         // independently. Until the guest processes the release it still believes the modifier is
         // held, so post an explicit release for every modifier and then wait before typing.
         // Without this the first character arrives as a modifier chord and is swallowed.
-        self.resyncRemoteDesktopModifiers()
+        self.resyncRemoteDesktopKeyboardState()
         let warmupMicros = Self.remoteDesktopWarmup
         if warmupMicros > 0 {
             self.log("[TypingService] Warming up remote keyboard channel for \(warmupMicros / 1000)ms")
@@ -1339,12 +1342,28 @@ final class TypingService {
         return .typed
     }
 
-    /// Posts a release for every modifier so the guest cannot be left believing one is held.
+    /// Puts the guest's keyboard back into a state where plain characters insert text.
     ///
-    /// A latched modifier in the guest is worse than a lost character: every subsequent letter
-    /// becomes a chord, and `Alt+<letter>` walks the focused application's menus rather than
-    /// inserting text.
-    private func resyncRemoteDesktopModifiers() {
+    /// Two things have to be undone, both caused by the dictation hotkey rather than by us:
+    ///
+    /// 1. A held modifier. The client forwards the hotkey modifier's press and release to the
+    ///    guest independently, so a lost release leaves the guest believing it is still down and
+    ///    every subsequent letter becomes a chord.
+    /// 2. Windows menu mode. This is the one that actually bites. An Option-based hotkey looks
+    ///    to the guest like a *bare Alt tap* - FluidVoice swallows the accompanying key as its
+    ///    hotkey, so the guest sees Alt down then Alt up with nothing between - and a bare Alt
+    ///    tap activates the focused window's menu bar. The transcript then navigates menus
+    ///    instead of typing: measured, `E` opens the Edit menu and the rest of the text is
+    ///    consumed. Escape exits menu mode.
+    ///
+    /// Escape rather than a second Alt tap on purpose. Both were measured to fix it, but an Alt
+    /// tap is a *toggle*: if menu mode were not active it would switch it on and cause exactly
+    /// the bug it is meant to prevent. Escape only ever exits, so it cannot create the bad
+    /// state. Waiting does not help - measured - because this is a mode, not latency.
+    ///
+    /// Escape is sent here as a deliberate reset, which is separate from the rule that Return
+    /// and Tab are never typed as transcript *content*.
+    private func resyncRemoteDesktopKeyboardState() {
         for keyCode in Self.remoteDesktopResyncModifierKeyCodes {
             guard let release = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
                 continue
@@ -1354,7 +1373,20 @@ final class TypingService {
             release.setIntegerValueField(.eventSourceUserData, value: Self.synthesizedEventUserData)
             release.post(tap: .cghidEventTap)
         }
-        self.log("[TypingService] Posted modifier resync before remote-desktop typing")
+
+        usleep(Self.remoteDesktopEscapeGapMicros)
+
+        if let escapeDown = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_Escape), keyDown: true),
+           let escapeUp = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_Escape), keyDown: false)
+        {
+            escapeDown.setIntegerValueField(.eventSourceUserData, value: Self.synthesizedEventUserData)
+            escapeUp.setIntegerValueField(.eventSourceUserData, value: Self.synthesizedEventUserData)
+            escapeDown.post(tap: .cghidEventTap)
+            usleep(10_000)
+            escapeUp.post(tap: .cghidEventTap)
+        }
+
+        self.log("[TypingService] Reset remote keyboard state (modifier releases + Escape)")
     }
 
     private func isRemoteDesktopTargetStillFrontmost(_ targetPID: pid_t) -> Bool {
