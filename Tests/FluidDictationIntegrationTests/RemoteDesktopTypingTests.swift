@@ -20,6 +20,21 @@ final class RemoteDesktopTypingTests: XCTestCase {
         ".": .init(keyCode: 47, needsShift: false),
     ]
 
+    /// `.strokes` payload, or nil when the plan reported unmappable characters.
+    private func strokes(_ text: String) -> [RemoteDesktopKeyStroke]? {
+        switch RemoteDesktopKeyMapResolver.plan(for: text, map: self.asciiish) {
+        case let .strokes(s): return s
+        case .unmappable: return nil
+        }
+    }
+
+    private func unmappable(_ text: String) -> [Character]? {
+        switch RemoteDesktopKeyMapResolver.plan(for: text, map: self.asciiish) {
+        case .strokes: return nil
+        case let .unmappable(c): return c
+        }
+    }
+
     // MARK: - Transliteration
 
     func testSmartPunctuationIsTransliteratedToASCII() {
@@ -48,7 +63,7 @@ final class RemoteDesktopTypingTests: XCTestCase {
 
     func testStrokesSpellTheTextAndCarryShiftWhereNeeded() throws {
         let strokes = try XCTUnwrap(
-            TypingService.remoteDesktopKeyStrokes(for: "aAb", map: self.asciiish)
+            self.strokes("aAb")
         )
         XCTAssertEqual(strokes.map(\.keyCode), [0, 0, 11])
         XCTAssertEqual(strokes.map(\.needsShift), [false, true, false])
@@ -56,25 +71,27 @@ final class RemoteDesktopTypingTests: XCTestCase {
 
     func testNewlinesAndTabsUseTheirOwnKeysRatherThanTheLayoutMap() throws {
         let strokes = try XCTUnwrap(
-            TypingService.remoteDesktopKeyStrokes(for: "a\nb\tb\r", map: self.asciiish)
+            self.strokes("a\nb\tb\r")
         )
         XCTAssertEqual(
             strokes.map(\.keyCode),
             [0, CGKeyCode(kVK_Return), 11, CGKeyCode(kVK_Tab), 11, CGKeyCode(kVK_Return)]
         )
-        XCTAssertTrue(strokes.allSatisfy { !$0.needsShift })
+        // Newline is Shift+Return: a bare Return submits in most chat clients, so a
+        // multi-paragraph transcript typed with Return would send one partial message per line.
+        XCTAssertEqual(strokes.map(\.needsShift), [false, true, false, false, false, true])
     }
 
     func testMappingIsAllOrNothing() {
         // A partially typed transcript is worse than none, so one unmappable character must
         // abort the whole attempt and let the caller fall back.
-        XCTAssertNil(TypingService.remoteDesktopKeyStrokes(for: "caf\u{00E9}", map: self.asciiish))
-        XCTAssertNil(TypingService.remoteDesktopKeyStrokes(for: "a\u{1F600}b", map: self.asciiish))
-        XCTAssertNotNil(TypingService.remoteDesktopKeyStrokes(for: "ab a", map: self.asciiish))
+        XCTAssertNil(self.strokes("caf\u{00E9}"))
+        XCTAssertNil(self.strokes("a\u{1F600}b"))
+        XCTAssertNotNil(self.strokes("ab a"))
     }
 
     func testEmptyTextMapsToNoStrokes() throws {
-        let strokes = try XCTUnwrap(TypingService.remoteDesktopKeyStrokes(for: "", map: self.asciiish))
+        let strokes = try XCTUnwrap(self.strokes(""))
         XCTAssertTrue(strokes.isEmpty)
     }
 
@@ -83,25 +100,23 @@ final class RemoteDesktopTypingTests: XCTestCase {
         // Restricted to letters present in `asciiish` so this exercises transliteration
         // rather than the toy fixture's coverage.
         let raw = "ab\u{2019}a \u{201C}ba\u{201D}\u{2026}"
-        XCTAssertNil(TypingService.remoteDesktopKeyStrokes(for: raw, map: self.asciiish))
+        XCTAssertNil(self.strokes(raw))
         let normalized = RemoteDesktopKeyMapResolver.transliterate(raw)
-        XCTAssertNotNil(TypingService.remoteDesktopKeyStrokes(for: normalized, map: self.asciiish))
+        XCTAssertNotNil(self.strokes(normalized))
     }
 
     // MARK: - Unmappable reporting
 
-    func testUnmappableCharactersAreReportedOnceEachInOrder() {
-        let found = RemoteDesktopKeyMapResolver.unmappableCharacters(
-            in: "caf\u{00E9} \u{00E9}clair \u{1F600}",
-            map: self.asciiish
-        )
+    func testUnmappableCharactersAreReportedOnceEachInOrder() throws {
+        // 'c', 'f', 'l', 'i' and 'r' are absent from the toy fixture on purpose - the point is
+        // first-occurrence order and de-duplication, not which letters a real layout has.
+        let found = try XCTUnwrap(self.unmappable("caf\u{00E9} \u{00E9}clair \u{1F600}"))
         XCTAssertEqual(found, ["c", "f", "\u{00E9}", "l", "i", "r", "\u{1F600}"])
     }
 
     func testWhitespaceControlCharactersAreNotReportedAsUnmappable() {
-        XCTAssertTrue(
-            RemoteDesktopKeyMapResolver.unmappableCharacters(in: "a\nb\tb\r", map: self.asciiish).isEmpty
-        )
+        XCTAssertNil(self.unmappable("a\nb\tb\r"), "Newlines and tabs have their own keys")
+        XCTAssertNil(self.unmappable("a\r\nb"), "CRLF is one grapheme cluster and must still map")
     }
 
     // MARK: - Layout resolution
@@ -111,22 +126,80 @@ final class RemoteDesktopTypingTests: XCTestCase {
         XCTAssertTrue(RemoteDesktopKeyMapResolver.resolve(layoutData: Data(), keyboardType: 0).isEmpty)
     }
 
-    func testLiveLayoutProducesATypeableASCIIRange() {
-        // Guards the UCKeyTranslate reverse scan against silently returning nothing.
-        let map = RemoteDesktopKeyMapResolver.current()
-        guard !map.isEmpty else {
-            return XCTFail("Expected a non-empty map for the active keyboard layout")
+    /// Reads an installed layout by identifier without enabling or switching any input source,
+    /// so these assertions do not depend on which keyboard the running machine has selected.
+    /// Same approach as `Tests/PasteKeyCodeResolverTests.swift`.
+    private func installedLayout(_ identifier: String) throws -> Data {
+        guard let sources = TISCreateInputSourceList(nil, true).takeRetainedValue() as? [TISInputSource] else {
+            throw XCTSkip("Unable to enumerate installed keyboard layouts")
         }
-        for character in "abcxyzABCXYZ0189 .,-'" {
-            XCTAssertNotNil(map[character], "Latin layouts must be able to type \(character)")
+        let match = sources.first { source in
+            guard let pointer = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return false }
+            return Unmanaged<CFString>.fromOpaque(pointer).takeUnretainedValue() as String == identifier
+        }
+        guard let match,
+              let pointer = TISGetInputSourceProperty(match, kTISPropertyUnicodeKeyLayoutData)
+        else {
+            throw XCTSkip("Layout not installed: \(identifier)")
+        }
+        return Unmanaged<CFData>.fromOpaque(pointer).takeUnretainedValue() as Data
+    }
+
+    private func usMap() throws -> [Character: RemoteDesktopKeyStroke] {
+        RemoteDesktopKeyMapResolver.resolve(
+            layoutData: try self.installedLayout("com.apple.keylayout.US"),
+            keyboardType: UInt32(LMGetKbdType())
+        )
+    }
+
+    func testUSLayoutResolvesExpectedStrokes() throws {
+        let map = try self.usMap()
+        XCTAssertEqual(map["a"], RemoteDesktopKeyStroke(keyCode: 0, needsShift: false))
+        XCTAssertEqual(map["A"], RemoteDesktopKeyStroke(keyCode: 0, needsShift: true))
+        XCTAssertEqual(map["1"], RemoteDesktopKeyStroke(keyCode: 18, needsShift: false))
+        XCTAssertEqual(map["!"], RemoteDesktopKeyStroke(keyCode: 18, needsShift: true))
+        XCTAssertEqual(map["v"], RemoteDesktopKeyStroke(keyCode: 9, needsShift: false))
+        XCTAssertEqual(map[" "], RemoteDesktopKeyStroke(keyCode: 49, needsShift: false))
+    }
+
+    func testUSLayoutCoversPrintableASCIIAndNothingElse() throws {
+        let map = try self.usMap()
+        for scalar in UInt32(0x20)...UInt32(0x7E) {
+            let character = Character(UnicodeScalar(scalar)!)
+            XCTAssertNotNil(map[character], "US layout must type U+\(String(scalar, radix: 16, uppercase: true))")
         }
         XCTAssertNil(map["\u{1F600}"], "No key press produces an emoji")
+        XCTAssertNil(map["\u{00E9}"], "US layout cannot type a precomposed accented letter")
+    }
+
+    func testKeypadAndISOSectionKeysAreExcluded() throws {
+        let map = try self.usMap()
+        // '*' and '+' must come from Shift+8 and Shift+= rather than the keypad, which carries a
+        // different scan code class than a person typing the same glyph.
+        XCTAssertEqual(map["*"], RemoteDesktopKeyStroke(keyCode: 28, needsShift: true))
+        XCTAssertEqual(map["+"], RemoteDesktopKeyStroke(keyCode: 24, needsShift: true))
+        XCTAssertFalse(map.values.contains { (65...92).contains($0.keyCode) }, "No keypad key codes")
+        XCTAssertFalse(map.values.contains { $0.keyCode == 10 }, "kVK_ISO_Section is excluded")
+    }
+
+    func testDeadKeysAreNotOfferedAsDirectlyTypeable() throws {
+        // On US-International the quote and grave keys compose the next character instead of
+        // typing a glyph, so offering them would silently corrupt text.
+        let map = RemoteDesktopKeyMapResolver.resolve(
+            layoutData: try self.installedLayout("com.apple.keylayout.USInternational-PC"),
+            keyboardType: UInt32(LMGetKbdType())
+        )
+        guard !map.isEmpty else { throw XCTSkip("US-International layout unavailable") }
+        for dead in ["\"", "'", "`", "\u{02C6}", "\u{02DC}"] {
+            XCTAssertNil(map[Character(dead)], "Dead key \(dead) must not be typeable directly")
+        }
+        XCTAssertNotNil(map["a"], "Ordinary letters must still map")
     }
 
     func testUnshiftedStrokeIsPreferredWhenBothReachTheSameCharacter() throws {
-        let map = RemoteDesktopKeyMapResolver.current()
-        guard let space = map[" "] else { throw XCTSkip("Active layout has no space mapping") }
-        XCTAssertFalse(space.needsShift, "Space must be typed without shift")
+        let map = try self.usMap()
+        XCTAssertEqual(map[" "]?.needsShift, false)
+        XCTAssertEqual(map["a"]?.needsShift, false)
     }
 
     // MARK: - Per-character delay parsing

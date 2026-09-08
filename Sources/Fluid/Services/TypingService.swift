@@ -128,21 +128,23 @@ final class TypingService {
     /// Windows App, formerly Microsoft Remote Desktop. Both ship this bundle identifier.
     private static let remoteDesktopBundleIdentifier = "com.microsoft.rdc.macos"
 
-    static let remoteDesktopClipboardSettleDefaultMs = 600
+    static let remoteDesktopClipboardSettleDefaultMs = 200
     static let remoteDesktopClipboardSettleMaximumMs = 10_000
     static let remoteDesktopClipboardSettleOverrideKey = "RemoteDesktopClipboardSettleMs"
 
-    /// Delay between writing the pasteboard and posting the paste chord for a remote-desktop
-    /// target. These clients appear to *poll* `NSPasteboard.changeCount` (AppKit publishes no
-    /// change notification) and only advertise a clipboard Format List once they notice; the
-    /// guest then fetches the data at paste time (MS-RDPECLIP delayed rendering). FreeRDP's
-    /// macOS client polls at 500ms, so if Windows App is comparable this needs to exceed one
-    /// poll interval.
+    /// Grace period between writing the pasteboard and starting the focus bounce that makes
+    /// the client re-advertise its clipboard.
+    ///
+    /// Measured against a live session: no settle length alone is sufficient. Four pastes over
+    /// 43 seconds, across four distinct pasteboard writes 8 seconds apart, all delivered the
+    /// *first* value, with plain and transient items behaving identically and a 2.5s settle
+    /// changing nothing. The focus change is the mechanism, not elapsed time - so this is only
+    /// a short grace to let the write land before focus moves.
     ///
     /// Clamped, because the value is multiplied into a `useconds_t` and an unclamped user
     /// default would trap.
     nonisolated static func remoteDesktopSettleMicros(override: NSNumber?) -> useconds_t {
-        let requested = override.map { Int($0.intValue) } ?? self.remoteDesktopClipboardSettleDefaultMs
+        let requested = override.map(\.intValue) ?? self.remoteDesktopClipboardSettleDefaultMs
         let clamped = min(max(0, requested), self.remoteDesktopClipboardSettleMaximumMs)
         return useconds_t(clamped * 1000)
     }
@@ -150,12 +152,13 @@ final class TypingService {
     static let remoteDesktopTypeDelayDefaultMs = 16
     static let remoteDesktopTypeDelayMaximumMs = 200
     static let remoteDesktopTypeDelayOverrideKey = "RemoteDesktopTypeDelayMs"
+    static let remoteDesktopFocusRecheckInterval = 10
 
     /// Pause after each character when typing into a remote-desktop session. The remote
     /// keyboard channel drops characters if they arrive faster than it forwards them.
     /// Overridable via the `RemoteDesktopTypeDelayMs` user default (no Settings UI).
     nonisolated static func remoteDesktopTypeDelayMicros(override: NSNumber?) -> useconds_t {
-        let requested = override.map { Int($0.intValue) } ?? self.remoteDesktopTypeDelayDefaultMs
+        let requested = override.map(\.intValue) ?? self.remoteDesktopTypeDelayDefaultMs
         let clamped = min(max(0, requested), self.remoteDesktopTypeDelayMaximumMs)
         return useconds_t(clamped * 1000)
     }
@@ -401,22 +404,26 @@ final class TypingService {
     /// frontmost app: the chord is delivered by the window server to whatever holds key focus,
     /// so treating a frontmost remote-desktop window as the target while something else owns
     /// the focused element would paste into the wrong place.
+    /// `focusedPID` and `frontmostPID` are autoclosures because resolving the focused element
+    /// is a synchronous Accessibility round trip to another process. This runs on every
+    /// dictation into every app, so it must not be paid when the preferred PID already decides
+    /// the answer.
     nonisolated static func resolveRemoteDesktopPID(
         preferredTargetPID: pid_t?,
-        focusedPID: pid_t?,
-        frontmostPID: pid_t?,
+        focusedPID: @autoclosure () -> pid_t?,
+        frontmostPID: @autoclosure () -> pid_t?,
         isRemoteDesktop: (pid_t) -> Bool
     ) -> pid_t? {
         if let preferredTargetPID, preferredTargetPID > 0 {
             return isRemoteDesktop(preferredTargetPID) ? preferredTargetPID : nil
         }
 
-        if let focusedPID {
-            return isRemoteDesktop(focusedPID) ? focusedPID : nil
+        if let focused = focusedPID() {
+            return isRemoteDesktop(focused) ? focused : nil
         }
 
-        if let frontmostPID, isRemoteDesktop(frontmostPID) {
-            return frontmostPID
+        if let frontmost = frontmostPID(), isRemoteDesktop(frontmost) {
+            return frontmost
         }
 
         return nil
@@ -657,19 +664,30 @@ final class TypingService {
         // ship the clipboard to the guest.
         if let remoteDesktopPID = self.remoteDesktopTargetPID(preferredTargetPID: preferredTargetPID) {
             self.log("[TypingService] Remote desktop target detected (PID \(remoteDesktopPID)); typing directly")
-            if self.insertTextViaRemoteDesktopTyping(text, targetPID: remoteDesktopPID) {
+            switch self.insertTextViaRemoteDesktopTyping(text, targetPID: remoteDesktopPID) {
+            case .typed:
                 self.log("[TypingService] SUCCESS: Remote-desktop typing path completed")
                 return true
+
+            case .unmappable:
+                // Paste is lossless but needs a focus bounce, so it is only worth the
+                // disruption when the layout genuinely cannot express the transcript.
+                self.log("[TypingService] Falling back to remote-desktop clipboard paste")
+                if self.insertTextViaRemoteDesktopPaste(text, targetPID: remoteDesktopPID) {
+                    self.log("[TypingService] SUCCESS: Remote-desktop paste path completed")
+                    return true
+                }
+
+            case .declined:
+                break
             }
 
-            // Only reached when the transcript contains characters this layout cannot type.
-            // Paste is lossless but needs a focus bounce, so it is the fallback, not the default.
-            self.log("[TypingService] Falling back to remote-desktop clipboard paste")
-            if self.insertTextViaRemoteDesktopPaste(text, targetPID: remoteDesktopPID) {
-                self.log("[TypingService] SUCCESS: Remote-desktop paste path completed")
-                return true
-            }
-            self.log("[TypingService] Remote-desktop paths failed; continuing fallback pipeline")
+            // Deliberately not falling through to the generic cascade. Those paths post via
+            // `postToPid`, which this client ignores while still reporting success, and the
+            // clipboard ones would re-activate the target and hold the user's clipboard for
+            // five seconds to no effect.
+            self.log("[TypingService] Remote-desktop insertion failed; not attempting generic fallbacks")
+            return false
         }
 
         if self.textInsertionMode == .standard,
@@ -1182,28 +1200,14 @@ final class TypingService {
         chord.keyUp.post(tap: .cghidEventTap)
     }
 
-    /// The key presses that spell `text`, or nil if any character has no key on this layout.
-    ///
-    /// All-or-nothing on purpose: a partially typed transcript is worse than none, so the
-    /// caller falls back rather than emitting a prefix.
-    nonisolated static func remoteDesktopKeyStrokes(
-        for text: String,
-        map: [Character: RemoteDesktopKeyStroke]
-    ) -> [RemoteDesktopKeyStroke]? {
-        var strokes: [RemoteDesktopKeyStroke] = []
-        strokes.reserveCapacity(text.count)
-        for character in text {
-            switch character {
-            case "\n", "\r":
-                strokes.append(RemoteDesktopKeyStroke(keyCode: CGKeyCode(kVK_Return), needsShift: false))
-            case "\t":
-                strokes.append(RemoteDesktopKeyStroke(keyCode: CGKeyCode(kVK_Tab), needsShift: false))
-            default:
-                guard let stroke = map[character] else { return nil }
-                strokes.append(stroke)
-            }
-        }
-        return strokes
+    /// Why a remote-desktop typing attempt did not produce text.
+    enum RemoteDesktopTypingOutcome {
+        /// The transcript was typed in full.
+        case typed
+        /// The layout cannot express some characters; the lossless clipboard path is worth trying.
+        case unmappable
+        /// Something else prevented typing. Trying the clipboard path would not help.
+        case declined
     }
 
     /// Types `text` into a remote-desktop session as real key presses, never touching the
@@ -1216,38 +1220,46 @@ final class TypingService {
     ///
     /// The cost is reach: the guest applies its own layout to those positions, and only
     /// characters the local layout can produce with at most shift can be expressed at all.
-    /// Anything else returns false so the caller can fall back without losing characters.
-    private func insertTextViaRemoteDesktopTyping(_ text: String, targetPID: pid_t) -> Bool {
+    private func insertTextViaRemoteDesktopTyping(
+        _ text: String,
+        targetPID: pid_t
+    ) -> RemoteDesktopTypingOutcome {
         let normalized = RemoteDesktopKeyMapResolver.transliterate(text)
         let map = Self.remoteDesktopKeyMapCache.snapshot()
 
         guard map.isEmpty == false else {
             self.log("[TypingService] ERROR: Remote-desktop key map unavailable; cannot type")
-            return false
+            return .declined
         }
 
-        guard let strokes = Self.remoteDesktopKeyStrokes(for: normalized, map: map) else {
-            let unmappable = RemoteDesktopKeyMapResolver.unmappableCharacters(in: normalized, map: map)
-            let described = unmappable
+        let strokes: [RemoteDesktopKeyStroke]
+        switch RemoteDesktopKeyMapResolver.plan(for: normalized, map: map) {
+        case let .strokes(planned):
+            strokes = planned
+        case let .unmappable(characters):
+            let described = characters
                 .map { "U+" + String($0.unicodeScalars.first?.value ?? 0, radix: 16, uppercase: true) }
                 .joined(separator: " ")
-            self.log("[TypingService] Remote-desktop typing skipped: \(unmappable.count) character(s) have no key on this layout (\(described))")
-            return false
+            self.log("[TypingService] Remote-desktop typing skipped: \(characters.count) character(s) have no key on this layout (\(described))")
+            return .unmappable
         }
 
         // Posting a chord while the user still physically holds a modifier merges the two, and
         // over a whole transcript that would corrupt every character.
         guard self.waitForPhysicalModifiersToRelease(timeout: 2) else {
             self.log("[TypingService] ERROR: Physical modifiers still held; skipping remote-desktop typing")
-            return false
+            return .declined
         }
 
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else {
+        guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
             self.log("[TypingService] ERROR: Target is no longer frontmost; skipping remote-desktop typing")
-            return false
+            return .declined
         }
 
-        // Built up front so a creation failure aborts before anything is typed.
+        // Built up front for two reasons: a creation failure aborts before anything is typed,
+        // and a nil-source CGEvent captures the combined-session modifier flags at creation, so
+        // building them all now - after the modifier wait - guarantees every event carries clean
+        // flags rather than picking up a previous synthetic shift that is still in flight.
         var chords: [SyntheticChord] = []
         chords.reserveCapacity(strokes.count)
         for stroke in strokes {
@@ -1256,19 +1268,34 @@ final class TypingService {
                 keyCode: stroke.keyCode
             ) else {
                 self.log("[TypingService] ERROR: Failed to create remote-desktop typing events")
-                return false
+                return .declined
             }
             chords.append(chord)
         }
 
         let perCharacterDelay = Self.remoteDesktopTypeDelay
         self.log("[TypingService] Typing \(chords.count) character(s) via HID tap at \(perCharacterDelay / 1000)ms/char")
-        for chord in chords {
+
+        for (index, chord) in chords.enumerated() {
+            // HID events go to whatever holds key focus, and a long transcript takes seconds.
+            // Without re-checking, clicking away mid-run sprays the remainder into another app -
+            // including Return presses that would confirm whatever dialog is focused there.
+            if index > 0, index % Self.remoteDesktopFocusRecheckInterval == 0,
+               self.isRemoteDesktopTargetStillFrontmost(targetPID) == false
+            {
+                self.log("[TypingService] ERROR: Target lost focus after \(index) character(s); stopping")
+                return .declined
+            }
             self.postRemoteDesktopChord(chord, keyGapMicros: 1500)
             usleep(perCharacterDelay)
         }
+
         self.log("[TypingService] Remote-desktop typing completed")
-        return true
+        return .typed
+    }
+
+    private func isRemoteDesktopTargetStillFrontmost(_ targetPID: pid_t) -> Bool {
+        NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID
     }
 
     /// Clipboard paste for a remote-desktop session.
@@ -1292,38 +1319,47 @@ final class TypingService {
             return false
         }
 
+        // Checked before the pasteboard is written so a doomed attempt does not churn the
+        // user's clipboard.
+        guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
+            self.log("[TypingService] ERROR: Target is not frontmost; skipping remote-desktop paste")
+            return false
+        }
+
+        guard let target = NSRunningApplication(processIdentifier: targetPID) else {
+            self.log("[TypingService] ERROR: Remote-desktop target no longer running")
+            return false
+        }
+
         return self.withTemporaryPasteboardString(text, restoreDelayMicros: 5_000_000) {
-            let settleMicros = Self.remoteDesktopClipboardSettleMicros
-            usleep(settleMicros)
-
-            // The chord is delivered by the window server to whatever holds key focus, not to
-            // `targetPID`, and the settle delay opens a window in which the user can switch
-            // apps. Re-check both the target and the modifier state, which the pre-write check
-            // has now left stale, rather than pasting into the wrong app.
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else {
-                self.log("[TypingService] ERROR: Frontmost app changed during settle; skipping remote-desktop paste")
-                return false
-            }
-
-            guard self.waitForPhysicalModifiersToRelease(timeout: 0.5) else {
-                self.log("[TypingService] ERROR: Physical modifiers held after settle; skipping remote-desktop paste")
-                return false
-            }
+            usleep(Self.remoteDesktopClipboardSettleMicros)
 
             // These clients only re-advertise their clipboard to the guest after a focus
             // change, so without this the guest pastes whatever it last synced. Measured: a
             // re-activation of the already-frontmost client is not enough; focus has to
-            // actually leave and come back, and it needs time to settle before the chord.
-            if let target = NSRunningApplication(processIdentifier: targetPID) {
-                NSRunningApplication.current.activate()
-                usleep(400_000)
-                target.activate(options: Self.focusRestoreActivationOptions)
-                usleep(1_500_000)
-                self.log("[TypingService] Bounced focus to force clipboard re-advertise")
+            // actually leave and come back, and it needs over a second to settle.
+            NSRunningApplication.current.activate(options: Self.focusRestoreActivationOptions)
+            usleep(400_000)
+
+            // If focus never actually left, the client has not re-advertised anything and the
+            // chord would paste whatever the guest last synced - someone else's clipboard
+            // content, into their session. Refuse rather than paste the wrong text.
+            guard self.isRemoteDesktopTargetStillFrontmost(targetPID) == false else {
+                self.log("[TypingService] ERROR: Focus never left the target; refusing to paste possibly stale content")
+                return false
             }
 
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetPID else {
+            target.activate(options: Self.focusRestoreActivationOptions)
+            usleep(1_500_000)
+            self.log("[TypingService] Bounced focus to force clipboard re-advertise")
+
+            guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
                 self.log("[TypingService] ERROR: Target not frontmost after focus bounce; skipping paste")
+                return false
+            }
+
+            guard self.waitForPhysicalModifiersToRelease(timeout: 0.5) else {
+                self.log("[TypingService] ERROR: Physical modifiers held after bounce; skipping remote-desktop paste")
                 return false
             }
 
@@ -1335,7 +1371,7 @@ final class TypingService {
                 return false
             }
 
-            self.log("[TypingService] Posting Ctrl+V chord via HID tap after \(settleMicros / 1000)ms settle")
+            self.log("[TypingService] Posting Ctrl+V chord via HID tap")
             self.postRemoteDesktopChord(chord)
             return true
         }

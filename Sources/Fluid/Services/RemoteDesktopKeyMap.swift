@@ -7,6 +7,15 @@ struct RemoteDesktopKeyStroke: Equatable {
     let needsShift: Bool
 }
 
+/// The result of spelling text out as key presses.
+///
+/// Modelled as a sum type rather than an optional array so the unmappable characters travel
+/// with the failure and the caller can distinguish "cannot type this" from "did not try".
+enum RemoteDesktopTypingPlan: Equatable {
+    case strokes([RemoteDesktopKeyStroke])
+    case unmappable([Character])
+}
+
 /// Maps characters to the key presses that produce them on the active keyboard layout, for
 /// typing into a remote-desktop session.
 ///
@@ -19,30 +28,43 @@ struct RemoteDesktopKeyStroke: Equatable {
 /// when the local and remote layouts agree. Non-Latin dictation needs the client's Unicode
 /// keyboard mode instead, which is outside what this can influence.
 enum RemoteDesktopKeyMapResolver {
-    /// Substitutions applied before mapping, for characters that have an unambiguous ASCII
-    /// spelling. Transcripts pick these up from AI enhancement rather than from speech, and
-    /// normalising them is standard practice when the destination only accepts plain input.
+    /// Virtual key codes for the numeric keypad. Excluded because they carry a different scan
+    /// code class than the character keys a person would use for the same glyph, and nothing on
+    /// a Latin layout is reachable only through them.
+    private static let keypadKeyCodeRange: ClosedRange<UInt16> = 65...92
+
+    /// `kVK_ISO_Section`. Excluded because ANSI Windows maps that position to backslash, so
+    /// typing the glyph it produces on a Mac ISO layout would emit the wrong character.
+    private static let isoSectionKeyCode: UInt16 = 10
+
+    /// Substitutions applied before mapping, for characters that have an unambiguous plain-text
+    /// spelling. These reach transcripts through AI enhancement rather than through speech, and
+    /// normalising them is standard practice for destinations that only accept plain input.
+    ///
+    /// Every character left unmapped costs a focus-stealing clipboard fallback, so breadth here
+    /// is worth having. Note for anyone extending this: two canonically-equivalent keys in a
+    /// dictionary literal trap at runtime, so keep the keys to distinct single scalars.
     static let transliterations: [Character: String] = [
-        "\u{2018}": "'", // left single quote
-        "\u{2019}": "'", // right single quote / curly apostrophe
-        "\u{201A}": "'",
-        "\u{201B}": "'",
-        "\u{201C}": "\"", // left double quote
-        "\u{201D}": "\"", // right double quote
-        "\u{201E}": "\"",
-        "\u{2032}": "'", // prime
-        "\u{2033}": "\"", // double prime
-        "\u{2013}": "-", // en dash
-        "\u{2014}": "--", // em dash
-        "\u{2015}": "--",
-        "\u{2212}": "-", // minus sign
-        "\u{2026}": "...", // ellipsis
-        "\u{00A0}": " ", // non-breaking space
-        "\u{202F}": " ", // narrow no-break space
-        "\u{2009}": " ", // thin space
-        "\u{2022}": "-", // bullet
-        "\u{00B7}": "-", // middle dot
-        "\u{2043}": "-",
+        // Quotes and apostrophes
+        "\u{2018}": "'", "\u{2019}": "'", "\u{201A}": "'", "\u{201B}": "'",
+        "\u{201C}": "\"", "\u{201D}": "\"", "\u{201E}": "\"", "\u{201F}": "\"",
+        "\u{2032}": "'", "\u{2033}": "\"",
+        "\u{00AB}": "\"", "\u{00BB}": "\"",
+        // Dashes and hyphens
+        "\u{2010}": "-", "\u{2011}": "-", "\u{2012}": "-",
+        "\u{2013}": "-", "\u{2014}": "--", "\u{2015}": "--",
+        "\u{2212}": "-",
+        // Spaces
+        "\u{00A0}": " ", "\u{2002}": " ", "\u{2003}": " ", "\u{2004}": " ",
+        "\u{2005}": " ", "\u{2006}": " ", "\u{2007}": " ", "\u{2008}": " ",
+        "\u{2009}": " ", "\u{200A}": " ", "\u{202F}": " ", "\u{3000}": " ",
+        // Invisible characters that would otherwise force the fallback for no visible gain
+        "\u{00AD}": "", "\u{200B}": "", "\u{200C}": "", "\u{200D}": "", "\u{FEFF}": "",
+        // Line and paragraph separators
+        "\u{2028}": "\n", "\u{2029}": "\n",
+        // Miscellaneous
+        "\u{2026}": "...", "\u{2022}": "-", "\u{00B7}": "-", "\u{2043}": "-",
+        "\u{2192}": "->",
     ]
 
     /// Applies ``transliterations``, leaving everything else untouched.
@@ -57,7 +79,6 @@ enum RemoteDesktopKeyMapResolver {
     }
 
     static func current() -> [Character: RemoteDesktopKeyStroke] {
-        precondition(Thread.isMainThread)
         guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
               let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
         else { return [:] }
@@ -77,22 +98,29 @@ enum RemoteDesktopKeyMapResolver {
             for needsShift in [false, true] {
                 let modifiers = needsShift ? UInt32(shiftKey >> 8) : 0
                 for key: UInt16 in 0..<128 {
-                    var dead: UInt32 = 0
+                    guard self.keypadKeyCodeRange.contains(key) == false,
+                          key != self.isoSectionKeyCode
+                    else { continue }
+
+                    var deadKeyState: UInt32 = 0
                     var length = 0
                     var characters = [UniChar](repeating: 0, count: 4)
+                    // Deliberately not `kUCKeyTranslateNoDeadKeysMask`: that mask reports a dead
+                    // key's standalone glyph, which would map e.g. `"` on US-International to a
+                    // key that actually composes the next character instead of typing a quote.
                     let status = UCKeyTranslate(
                         layout,
                         key,
                         UInt16(kUCKeyActionDisplay),
                         modifiers,
                         keyboardType,
-                        UInt32(kUCKeyTranslateNoDeadKeysMask),
-                        &dead,
+                        0,
+                        &deadKeyState,
                         characters.count,
                         &length,
                         &characters
                     )
-                    guard status == noErr, length == 1 else { continue }
+                    guard status == noErr, deadKeyState == 0, length == 1 else { continue }
                     let scalarValue = characters[0]
                     // Printable only: control codes and delete are delivered as their own keys.
                     guard scalarValue >= 0x20, scalarValue != 0x7f,
@@ -108,19 +136,44 @@ enum RemoteDesktopKeyMapResolver {
         }
     }
 
-    /// The characters in `text` that no key press on this layout can produce.
-    static func unmappableCharacters(
-        in text: String,
+    /// Spells `text` out as key presses, or reports every character that has no key on this
+    /// layout.
+    ///
+    /// All-or-nothing on purpose: a partially typed transcript is worse than none, so the caller
+    /// falls back rather than emitting a prefix.
+    ///
+    /// Newline is typed as **Shift+Return**, not Return. A bare Return submits in most chat
+    /// clients, so a multi-paragraph transcript typed with Return would send one partial message
+    /// per line; Shift+Return is a line break in every mainstream chat client and a soft break
+    /// in word processors.
+    static func plan(
+        for text: String,
         map: [Character: RemoteDesktopKeyStroke]
-    ) -> [Character] {
-        var seen: Set<Character> = []
-        var result: [Character] = []
-        for character in text where map[character] == nil {
-            // Newlines and tabs are typed as their own key codes, not through the layout map.
-            if character == "\n" || character == "\r" || character == "\t" { continue }
-            if seen.insert(character).inserted { result.append(character) }
+    ) -> RemoteDesktopTypingPlan {
+        var strokes: [RemoteDesktopKeyStroke] = []
+        strokes.reserveCapacity(text.count)
+        var unmappable: [Character] = []
+        var seenUnmappable: Set<Character> = []
+
+        for character in text {
+            switch character {
+            case "\n", "\r", "\r\n":
+                // "\r\n" is a single grapheme cluster in Swift and is not equal to "\n",
+                // so it has to be matched explicitly.
+                strokes.append(RemoteDesktopKeyStroke(keyCode: CGKeyCode(kVK_Return), needsShift: true))
+            case "\t":
+                strokes.append(RemoteDesktopKeyStroke(keyCode: CGKeyCode(kVK_Tab), needsShift: false))
+            default:
+                guard let stroke = map[character] else {
+                    if seenUnmappable.insert(character).inserted { unmappable.append(character) }
+                    continue
+                }
+                strokes.append(stroke)
+            }
         }
-        return result
+
+        guard unmappable.isEmpty else { return .unmappable(unmappable) }
+        return .strokes(strokes)
     }
 }
 
