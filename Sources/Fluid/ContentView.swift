@@ -3569,6 +3569,12 @@ struct ContentView: View {
     }
 
     private func applyHistoryTextOutput(_ text: String, saveToHistory: Bool) async {
+        // Records this insertion's own modifiers - an empty reading included. Without it the
+        // snapshot from an earlier dictation stays pending (nothing consumes it unless that
+        // dictation went to a remote session) and this insertion would decide the guest's menu
+        // state from it.
+        TypingService.noteDictationHotkeyModifiers()
+
         // Keep hotkey/recording state deterministic before applying output text.
         if self.asr.isRunning {
             DebugLogger.shared.info("Actions: stopping active recording before history action output", source: "ContentView")
@@ -3636,6 +3642,12 @@ struct ContentView: View {
     }
 
     private func reprocessDictationText(_ transcribedText: String) async {
+        // Records this insertion's own modifiers - an empty reading included. Without it the
+        // snapshot from an earlier dictation stays pending (nothing consumes it unless that
+        // dictation went to a remote session) and this insertion would decide the guest's menu
+        // state from it.
+        TypingService.noteDictationHotkeyModifiers()
+
         // If live recording is still active, stop it first so reprocess does not
         // leave ASR running in the background (which causes the next hotkey press
         // to behave like a stop instead of start).

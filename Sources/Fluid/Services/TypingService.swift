@@ -914,6 +914,13 @@ final class TypingService {
 
             if resetKeyboardState {
                 self.resyncRemoteDesktopKeyboardState()
+                // The reset sleeps for well over 150ms and posts Escape globally, so the
+                // destination has to be re-confirmed before Return - which activates whatever
+                // now holds focus - rather than trusting the check made before the reset.
+                guard self.isRemoteDesktopTargetStillFrontmost(targetPID) else {
+                    self.log("[TypingService] ERROR: Target lost focus during the keyboard reset; not sending \(key.displayName)")
+                    return false
+                }
             }
             self.log("[TypingService] Spoken Send: posting \(key.displayName) chord via HID tap for remote-desktop target")
             self.postRemoteDesktopChord(chord)
@@ -1372,6 +1379,22 @@ final class TypingService {
             return .declined
         }
 
+        // Captured *before* the reset and the warm-up below, not after. Those take up to three
+        // seconds together, and a PID cannot tell one connection window of this client from
+        // another - so a baseline taken afterwards would adopt whichever session the user had
+        // switched to during the wait, and every later check would then agree with it and send
+        // the whole transcript to the wrong remote machine.
+        //
+        // Required, not optional. Without an element there is nothing but the PID to check, and
+        // the PID cannot see a connection switch at all. Only insist on it when Accessibility is
+        // actually trusted: untrusted is a different failure that is already refused upstream,
+        // and a nil element there says nothing about the destination.
+        let focusTarget = Self.captureSystemFocusTarget()
+        if focusTarget == nil, AXIsProcessTrusted() {
+            self.log("[TypingService] ERROR: No focused element for the remote session; refusing to type blind")
+            return .declined
+        }
+
         // The hotkey that started this dictation is very often a modifier (the default is
         // modifier-only), and the client forwards that modifier's press and release to the guest
         // independently. Until the guest processes the release it still believes the modifier is
@@ -1401,11 +1424,13 @@ final class TypingService {
             chords.append(chord)
         }
 
-        // A PID cannot distinguish one connection window of the same client from another, so
-        // capture the focused element too and re-confirm it periodically. The element check is
-        // an Accessibility round trip, so it runs on an interval while the cheap PID check runs
-        // before every chord.
-        let focusTarget = Self.captureSystemFocusTarget()
+        // Re-confirmed here because the baseline was taken before the reset and warm-up: this is
+        // the check that catches a connection switch made during that window.
+        if let focusTarget, Self.isExactFocusTargetActive(focusTarget) == false {
+            self.log("[TypingService] ERROR: Focused element changed during the reset or warm-up; not typing")
+            return .declined
+        }
+
         let perCharacterDelay = Self.remoteDesktopTypeDelay
         self.log("[TypingService] Typing \(chords.count) character(s) via HID tap at \(perCharacterDelay / 1000)ms/char")
 
@@ -1463,7 +1488,18 @@ final class TypingService {
         // Prefer what was actually held when this dictation started. Asking whether *any*
         // configured shortcut uses Option or Command would send Escape for a dictation begun
         // with a mouse or a plain-key shortcut, where there is no menu to dismiss.
-        if let observed = Self.consumeDictationHotkeyModifiers() {
+        // A non-empty reading is trustworthy: something was genuinely held. An *empty* one is
+        // not, because the sample is taken when capture starts rather than when the hotkey
+        // fires - and a modifier-only shortcut in toggle mode only starts recording once the
+        // modifier is released, so the flags are already gone by then. Treating empty as "no
+        // modifier" would skip Escape for exactly the default shortcut that needs it most, so
+        // it falls through to the configured-shortcut check instead.
+        // Caps Lock and the numeric-pad bit can be set without any key being held, so compare
+        // against the modifiers a shortcut can actually use rather than against an empty set.
+        let heldModifiers: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand, .maskSecondaryFn]
+        if let observed = Self.consumeDictationHotkeyModifiers(),
+           observed.intersection(heldModifiers).isEmpty == false
+        {
             return observed.contains(.maskAlternate) || observed.contains(.maskCommand)
         }
 
